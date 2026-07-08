@@ -8,9 +8,10 @@ This is a demo, not production: state is per-session, work is capped at 5
 images per run, and requests are serialized through Gradio's queue so a shared
 free Space degrades into a wait rather than a flurry of 429s.
 """
-
-import os
 import sys
+print("!!! APP IS STARTING !!!", file=sys.stderr)
+sys.stderr.flush()
+import os
 import tempfile
 import zipfile
 from pathlib import Path
