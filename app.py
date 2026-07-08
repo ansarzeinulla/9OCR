@@ -143,19 +143,19 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader", api_open=False) as demo:
     slots = []
     for i in range(MAX_IMAGES):
         with gr.Row():
-            img = gr.Image(label=f"Table {i + 1}", type="filepath", height=150)
+            img = gr.Image(label=f"Table {i + 1}", type="filepath", height=150, show_api=False)
             res = gr.Dropdown(RESULT_CHOICES, value="unknown",
-                              label="Result (1-0 = White won)", scale=1)
+                              label="Result (1-0 = White won)", scale=1, show_api=False)
         slots.extend([img, res])
 
     convert_btn = gr.Button("Convert", variant="primary")
 
     results_table = gr.Dataframe(
         headers=["game", "legal plies", "stopped", "beam PGN"],
-        label="Results", wrap=True, interactive=False,
+        label="Results", wrap=True, interactive=False, show_api=False
     )
-    gallery = gr.Gallery(label="Annotated reconstruction", columns=2, height="auto")
-    zip_out = gr.File(label="Download all PGNs (zip)")
+    gallery = gr.Gallery(label="Annotated reconstruction", columns=2, height="auto", show_api=False)
+    zip_out = gr.File(label="Download all PGNs (zip)", show_api=False)
 
     convert_btn.click(
         _busy_wrapper,
