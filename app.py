@@ -11,6 +11,21 @@ free Space degrades into a wait rather than a flurry of 429s.
 import sys
 print("!!! APP IS STARTING !!!", file=sys.stderr)
 sys.stderr.flush()
+
+# --- MONKEY PATCH GRADIO CLIENT BUG ---
+try:
+    import gradio_client.utils as client_utils
+    orig_get_type = client_utils.get_type
+    def patched_get_type(schema):
+        if isinstance(schema, bool):
+            return "boolean"
+        return orig_get_type(schema)
+    client_utils.get_type = patched_get_type
+    print("[app] Applied monkey-patch to gradio_client.utils.get_type", flush=True)
+except Exception as e:
+    print(f"[app] Failed to apply monkey-patch: {e}", flush=True)
+# --------------------------------------
+
 import os
 import tempfile
 import zipfile
