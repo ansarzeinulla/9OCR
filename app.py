@@ -128,7 +128,7 @@ def _busy_wrapper(*args):
         raise gr.Error(f"Something went wrong: {exc}")
 
 
-with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
+with gr.Blocks(title="Togyzkumalak Scoresheet Reader", api_open=False) as demo:
     gr.Markdown(
         "# Togyzkumalak Scoresheet Reader\n"
         "Upload up to **5** scoresheet photos, optionally tag each game's known "
