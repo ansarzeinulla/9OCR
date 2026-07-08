@@ -158,19 +158,19 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
     slots = []
     for i in range(MAX_IMAGES):
         with gr.Row():
-            img = gr.Image(label=f"Table {i + 1}", type="filepath", height=150, show_api=False)
+            img = gr.Image(label=f"Table {i + 1}", type="filepath", height=150)
             res = gr.Dropdown(RESULT_CHOICES, value="unknown",
-                              label="Result (1-0 = White won)", scale=1, show_api=False)
+                              label="Result (1-0 = White won)", scale=1)
         slots.extend([img, res])
 
     convert_btn = gr.Button("Convert", variant="primary")
 
     results_table = gr.Dataframe(
         headers=["game", "legal plies", "stopped", "beam PGN"],
-        label="Results", wrap=True, interactive=False, show_api=False
+        label="Results", wrap=True, interactive=False,
     )
-    gallery = gr.Gallery(label="Annotated reconstruction", columns=2, height="auto", show_api=False)
-    zip_out = gr.File(label="Download all PGNs (zip)", show_api=False)
+    gallery = gr.Gallery(label="Annotated reconstruction", columns=2, height="auto")
+    zip_out = gr.File(label="Download all PGNs (zip)")
 
     convert_btn.click(
         _busy_wrapper,
@@ -180,8 +180,7 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
 
 # Serialize CPU-heavy runs: callers wait in a bounded queue instead of
 # overloading the shared Space (which is what triggers 429s).
-# api_open=False prevents standard HTTP calls from skipping the queue.
-demo.queue(max_size=16, default_concurrency_limit=1, api_open=False)
+demo.queue(max_size=16, default_concurrency_limit=1)
 
 if __name__ == "__main__":
     # Bind explicitly to 0.0.0.0 and the Space's port so HF can detect the
