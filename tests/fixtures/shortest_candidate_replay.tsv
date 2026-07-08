@@ -1,0 +1,14 @@
+shortest_candidate_halfmoves	11
+initial_position	p1_side=81	p2_side=81	p1_kazan=0	p2_kazan=0
+halfmove	player	move	p1_kazan	p2_kazan	p1_side	p2_side	p1_tuzdyk	p2_tuzdyk	winner
+1	P1	98	10	0	73	79	-1	-1	ongoing
+2	P2	22	10	10	65	77	-1	-1	ongoing
+3	P1	87	22	10	58	72	-1	-1	ongoing
+4	P2	12	22	10	60	70	-1	-1	ongoing
+5	P1	76	36	10	54	62	-1	-1	ongoing
+6	P2	25	36	10	54	62	-1	-1	ongoing
+7	P1	65	52	10	49	51	-1	-1	ongoing
+8	P2	13	52	10	49	51	-1	-1	ongoing
+9	P1	93	70	10	46	36	-1	-1	ongoing
+10	P2	25	70	10	46	36	-1	-1	ongoing
+11	P1	54	88	10	42	22	-1	-1	P1

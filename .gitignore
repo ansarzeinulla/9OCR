@@ -1,0 +1,21 @@
+__pycache__/
+.DS_Store
+venv/
+venv311/
+
+# datasets & training artifacts (regenerable)
+ingredients/
+glyph_data/
+checkpoints/
+train_data/
+train_data2/
+train_data3/
+train_data4/
+train_data5/
+preview*.png
+out/
+project.zip
+
+# archived experiments: keep code, ignore heavy model binaries
+legacy/*.pkl
+legacy/*.pth

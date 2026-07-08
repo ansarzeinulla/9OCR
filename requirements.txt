@@ -1,0 +1,8 @@
+# HuggingFace Space (serving) deps - torch-free, installed by the Space builder.
+# Training/export uses requirements-train.txt instead.
+gradio>=6.20
+onnxruntime>=1.20
+numpy>=1.24
+# pin below OpenCV 5.x: the pipeline's cv2 calls are tested against 4.x
+opencv-python-headless>=4.8,<5
+pillow>=10.0

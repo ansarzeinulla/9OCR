@@ -1,0 +1,9 @@
+# Training + ONNX export deps (local / Colab GPU). The Space itself does NOT
+# install these - it only needs the torch-free serving set in requirements.txt.
+torch>=2.1
+torchvision>=0.16
+onnx>=1.16
+onnxscript>=0.1
+numpy>=1.24
+opencv-python-headless>=4.8
+pillow>=10.0
