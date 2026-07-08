@@ -143,7 +143,7 @@ def _busy_wrapper(*args):
         raise gr.Error(f"Something went wrong: {exc}")
 
 
-with gr.Blocks(title="Togyzkumalak Scoresheet Reader", api_open=False) as demo:
+with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
     gr.Markdown(
         "# Togyzkumalak Scoresheet Reader\n"
         "Upload up to **5** scoresheet photos, optionally tag each game's known "
@@ -180,7 +180,8 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader", api_open=False) as demo:
 
 # Serialize CPU-heavy runs: callers wait in a bounded queue instead of
 # overloading the shared Space (which is what triggers 429s).
-demo.queue(max_size=16, default_concurrency_limit=1)
+# api_open=False prevents standard HTTP calls from skipping the queue.
+demo.queue(max_size=16, default_concurrency_limit=1, api_open=False)
 
 if __name__ == "__main__":
     # Bind explicitly to 0.0.0.0 and the Space's port so HF can detect the
