@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .classes import CLASSES, EMPTY
+from .classes import CLASSES, DASH, DIAGRAM_CLASSES, EMPTY, TUZDYK
 from .glyphs import GlyphSampler
 
 # working resolution: glyphs are rendered at this digit height, the finished
@@ -206,12 +206,116 @@ def synthesize_cell(
     return Image.fromarray(_camera_effects(img, rng))
 
 
-def _preview(path: str, seed: int, count: int) -> None:
+def _paste_clipped(alpha: np.ndarray, mask: np.ndarray, x: int, y: int) -> None:
+    """max-blend `mask` onto `alpha` at (x, y), clipping at the canvas edges
+    (diagram digits regularly overflow the printed cell borders)."""
+    h, w = alpha.shape
+    mh, mw = mask.shape
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(w, x + mw), min(h, y + mh)
+    if x1 <= x0 or y1 <= y0:
+        return
+    region = alpha[y0:y1, x0:x1]
+    np.maximum(region, mask[y0 - y : y1 - y, x0 - x : x1 - x], out=region)
+
+
+def _dash_mask(rng: random.Random) -> np.ndarray:
+    """A handwritten '-' (zero mark): one short, slightly curved stroke."""
+    s = 64
+    canvas = np.zeros((s // 2, s), np.float32)
+    y = s // 4 + rng.randint(-4, 4)
+    x0, x1 = rng.randint(2, 12), rng.randint(52, 62)
+    mid = ((x0 + x1) // 2, y + rng.randint(-6, 6))
+    pts = np.array([(x0, y), mid, (x1, y + rng.randint(-4, 4))], np.int32)
+    cv2.polylines(canvas, [pts], False, 1.0, rng.randint(3, 6), cv2.LINE_AA)
+    ys, xs = np.where(canvas > 0.1)
+    return canvas[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+
+
+def synthesize_diagram_cell(
+    class_name: str, sampler: GlyphSampler, rng: random.Random
+) -> Image.Image:
+    """Render one board-diagram cell photo: a pit/kazan value 0-81, a tuzdyk
+    'x', a zero '-', or 'empty'.
+
+    Diagram crops differ from move cells: they are squarer, always framed by
+    printed grid lines (drawn on several edges), digits often overflow the
+    row height and neighboring digits bleed into the crop sides.
+    """
+    # --- ink masks for the written symbol ---
+    if class_name == EMPTY:
+        masks: list[np.ndarray] = []
+    elif class_name == DASH:
+        m = _dash_mask(rng)
+        target_w = max(10, int(RENDER_DIGIT_H * rng.uniform(0.35, 0.8)))
+        target_h = max(4, int(m.shape[0] * target_w / m.shape[1]))
+        masks = [cv2.resize(m, (target_w, target_h), interpolation=cv2.INTER_LINEAR)]
+    else:
+        chars = class_name if class_name == TUZDYK else str(int(class_name))
+        slant = rng.uniform(-0.10, 0.40)
+        masks = []
+        for char in chars:
+            mask = sampler.sample(char, rng)
+            rel_h = rng.uniform(0.55, 0.95) if char == "x" else rng.uniform(0.85, 1.15)
+            target_h = max(8, int(RENDER_DIGIT_H * rel_h))
+            target_w = max(4, int(mask.shape[1] * target_h / mask.shape[0]))
+            mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            mask = _transform_mask(mask, rng.uniform(-7, 7), slant + rng.uniform(-0.05, 0.05))
+            masks.append(_vary_thickness(mask, rng))
+
+    gaps = [int(rng.uniform(-0.22, 0.10) * masks[i].shape[1]) for i in range(len(masks) - 1)]
+    total_w = sum(m.shape[1] for m in masks) + sum(gaps)
+    max_h = max((m.shape[0] for m in masks), default=RENDER_DIGIT_H)
+
+    # --- cell geometry: squarish crop, digits may overflow it vertically ---
+    fill = rng.uniform(0.55, 1.25)  # >1: taller than the printed row
+    cell_h = max(24, int(max_h / fill))
+    aspect = rng.uniform(0.9, 1.9)
+    cell_w = max(int(cell_h * aspect), int(total_w * rng.uniform(0.85, 1.15)))
+
+    alpha = np.zeros((cell_h, cell_w), np.float32)
+    x = int((cell_w - total_w) * rng.uniform(0.1, 0.9)) if masks else 0
+    for i, mask in enumerate(masks):
+        mh = mask.shape[0]
+        y = int((cell_h - mh) * rng.uniform(0.25, 0.75)) if cell_h > mh else int(
+            (cell_h - mh) * rng.uniform(0.3, 0.7)
+        )
+        _paste_clipped(alpha, mask, x, y)
+        if i < len(gaps):
+            x += mask.shape[1] + gaps[i]
+
+    # --- neighbor bleed: fragments of adjacent cells' digits at the sides ---
+    if rng.random() < 0.3:
+        frag = sampler.sample(rng.choice("0123456789"), rng)
+        fh = max(8, int(RENDER_DIGIT_H * rng.uniform(0.7, 1.1)))
+        fw = max(4, int(frag.shape[1] * fh / frag.shape[0]))
+        frag = cv2.resize(frag, (fw, fh), interpolation=cv2.INTER_LINEAR)
+        outside = rng.uniform(0.6, 0.9)
+        fx = -int(fw * outside) if rng.random() < 0.5 else cell_w - int(fw * (1 - outside))
+        _paste_clipped(alpha, frag, fx, int((cell_h - fh) * rng.uniform(0.2, 0.8)))
+
+    img = _compose_ink(_paper(rng, cell_h, cell_w), alpha, rng)
+    # printed grid borders: diagram crops nearly always contain them
+    for _ in range(rng.randint(1, 4) if rng.random() < 0.85 else 0):
+        img = _add_border_lines(img, rng)
+
+    out_h = rng.randint(20, 90)  # pit rows are small on the sheet
+    out_w = max(12, int(cell_w * out_h / cell_h))
+    img = cv2.resize(img, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    return Image.fromarray(_camera_effects(img, rng))
+
+
+def _preview(path: str, seed: int, count: int, task: str = "moves") -> None:
     """Render a comparison grid: the real-crop classes first, then random ones."""
     sampler = GlyphSampler()
     rng = random.Random(seed)
-    fixed = ["96", "77", "13x", "37", "85", "42"] * 2
-    names = fixed + [rng.choice(CLASSES) for _ in range(max(0, count - len(fixed)))]
+    if task == "diagram":
+        fixed = ["x", "-", "0", "7", "12", "45", "81", "empty"]
+        pool, synth_fn = DIAGRAM_CLASSES, synthesize_diagram_cell
+    else:
+        fixed = ["96", "77", "13x", "37", "85", "42"] * 2
+        pool, synth_fn = CLASSES, synthesize_cell
+    names = fixed + [rng.choice(pool) for _ in range(max(0, count - len(fixed)))]
 
     tile_w, tile_h, caption = 200, 100, 14
     cols = 6
@@ -221,7 +325,7 @@ def _preview(path: str, seed: int, count: int) -> None:
 
     draw = ImageDraw.Draw(sheet)
     for i, name in enumerate(names):
-        cell = synthesize_cell(name, sampler, rng).resize((tile_w, tile_h))
+        cell = synth_fn(name, sampler, rng).resize((tile_w, tile_h))
         cx, cy = (i % cols) * tile_w, (i // cols) * (tile_h + caption)
         sheet.paste(cell, (cx, cy + caption))
         draw.text((cx + 4, cy + 1), name, fill=0)
@@ -234,5 +338,6 @@ if __name__ == "__main__":
     parser.add_argument("--preview", default="preview.png", help="output image path")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n", type=int, default=48, help="number of cells")
+    parser.add_argument("--task", choices=["moves", "diagram"], default="moves")
     args = parser.parse_args()
-    _preview(args.preview, args.seed, args.n)
+    _preview(args.preview, args.seed, args.n, args.task)

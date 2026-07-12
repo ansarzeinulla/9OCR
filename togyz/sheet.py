@@ -26,11 +26,13 @@ CELL_MARGIN = 0.15  # expand crops; handwriting overflows the printed cells
 
 @dataclass
 class Cell:
-    move_no: int  # 1-80
-    side: str  # "W" (Bast.) or "B" (Kost.)
+    move_no: int  # move cells: 1-80; diagram cells: checkpoint move (10..80)
+    side: str  # "W" (Bast.) or "B" (Kost.); for pits this is the row owner
     bbox: tuple[int, int, int, int]  # x, y, w, h in original image coords
     image: Image.Image
     quad: np.ndarray | None = None  # 4x2 original-image corners (tilt-aware)
+    kind: str = "move"  # "move" | "kazan" | "pit"
+    pit_index: int = 0  # 1-9 for pit cells (scoresheet numbering), else 0
 
 
 def _grid_mask(gray: np.ndarray) -> np.ndarray:
@@ -82,6 +84,12 @@ def _find_table_quads(gray: np.ndarray) -> list[np.ndarray]:
             f"Found only {len(quads)} move tables (need {TABLES}). "
             "Check photo quality/framing."
         )
+    # the 8 move tables all have near-identical area; drop outliers like the
+    # footer/signature block, which can out-size a genuine table
+    median_area = float(np.median([a for a, _ in quads]))
+    consistent = [(a, q) for a, q in quads if 0.5 * median_area < a < 2.0 * median_area]
+    if len(consistent) >= TABLES:
+        quads = consistent
     quads = [q for _, q in sorted(quads, key=lambda t: -t[0])[:TABLES]]
     # split into top/bottom bands by y, order each band left to right
     quads.sort(key=lambda q: q[:, 1].mean())
@@ -139,12 +147,26 @@ def _row_lines(warped: np.ndarray) -> list[int]:
     return rows
 
 
-def extract_cells(image) -> tuple[list[Cell], Image.Image]:
+def _map_segment(inverse: np.ndarray, p0, p1) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Map a rectified-table segment back onto the original sheet."""
+    pts = np.array([p0, p1], np.float32).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(pts, inverse).reshape(2, 2)
+    return (
+        (int(mapped[0][0]), int(mapped[0][1])),
+        (int(mapped[1][0]), int(mapped[1][1])),
+    )
+
+
+def extract_cells(image, with_gridlines: bool = False):
     """All 160 move cells (80 moves x W/B) plus the upright sheet image.
 
     `image` is a path (str/Path) or a PIL.Image. Each table is
     perspective-rectified before being split, so cell crops stay aligned even
     on tilted phone photos.
+
+    Returns (cells, sheet) or, with `with_gridlines`, (cells, sheet, gridlines)
+    where gridlines is a list of ((x0, y0), (x1, y1)) sheet-coordinate segments
+    for every row/column separator used during segmentation.
     """
     if isinstance(image, Image.Image):
         pil = ImageOps.exif_transpose(image).convert("L")
@@ -154,11 +176,17 @@ def extract_cells(image) -> tuple[list[Cell], Image.Image]:
     gray = np.asarray(pil)
 
     cells: list[Cell] = []
+    gridlines: list[tuple[tuple[int, int], tuple[int, int]]] = []
     for t, quad in enumerate(_find_table_quads(gray)):
         warped, inverse = _rectify_table(gray, quad)
         th, tw = warped.shape
         rows = _row_lines(warped)
         cols = [round(f * tw) for f in COLUMN_FRACTIONS]
+        if with_gridlines:
+            for y in rows:
+                gridlines.append(_map_segment(inverse, (0, y), (tw, y)))
+            for x in cols:
+                gridlines.append(_map_segment(inverse, (x, rows[0]), (x, rows[-1])))
         for r in range(ROWS_PER_TABLE):
             y0, y1 = rows[r + 1], rows[r + 2]  # rows[0..1] is the header
             for col_index, side in ((1, "W"), (2, "B")):
@@ -180,37 +208,132 @@ def extract_cells(image) -> tuple[list[Cell], Image.Image]:
                 cells.append(
                     Cell(t * ROWS_PER_TABLE + r + 1, side, bbox, crop, sheet_quad)
                 )
+    if with_gridlines:
+        return cells, pil, gridlines
     return cells, pil
 
 
-def extract_kazan_cells(sheet: Image.Image) -> list[Cell]:
-    """Kazan checkpoint boxes from the 8 summary strips between table bands.
+PIT_MARGIN_Y = 0.25  # pit digits regularly overflow the printed row height
+PIT_MARGIN_X = 0.15  # and bleed a little into neighboring columns
 
-    After every 10 moves the scorer records both kazan counts next to a small
-    board diagram: the box protruding ABOVE the strip is the Kost. (Black)
-    kazan, the box BELOW is the Bast. (White) kazan. Returned as Cell objects
-    with move_no = the checkpoint move (10, 20, ... 80) and side "B"/"W".
-    The 2x9 board-pit grid itself is ignored (too messy to read reliably).
+
+def _strip_pit_grid(mask: np.ndarray, gray: np.ndarray,
+                    strip_bbox: tuple[int, int, int, int], checkpoint: int) -> list[Cell]:
+    """The 18 pit cells of the 2x9 board diagram inside one summary strip.
+
+    Upper row = Kost. (Black), pit indexes 9..1 left-to-right; lower row =
+    Bast. (White), indexes 1..9. Grid lines are detected inside the strip;
+    when detection is incomplete the known uniform 2x9 structure is used.
+    """
+    x, y, bw, bh = strip_bbox
+    h, w = gray.shape
+    sub = mask[y : y + bh, x : x + bw]
+
+    # horizontal separators: top / middle / bottom of the 2x9 grid
+    hlines = _detect_lines(sub, axis=0, min_frac=0.55)
+    if len(hlines) < 2:
+        return []
+    top, bottom = hlines[0], hlines[-1]
+    if bottom - top < 6:
+        return []
+    mid_target = (top + bottom) / 2
+    inner = [v for v in hlines if top + 2 < v < bottom - 2]
+    middle = min(inner, key=lambda v: abs(v - mid_target)) if inner else int(round(mid_target))
+
+    # vertical separators: 10 column lines across the grid band
+    band = sub[top : bottom + 1]
+    vlines = _detect_lines(band, axis=1, min_frac=0.5)
+    if len(vlines) != 10:
+        if len(vlines) >= 2:
+            x0, x1 = vlines[0], vlines[-1]
+        else:
+            xs = np.where(band.sum(axis=0) > 0)[0]
+            x0, x1 = (int(xs.min()), int(xs.max())) if len(xs) else (0, bw - 1)
+        vlines = [round(x0 + j * (x1 - x0) / 9) for j in range(10)]
+
+    cells: list[Cell] = []
+    rows = ((top, middle, "B"), (middle, bottom, "W"))
+    for ry0, ry1, owner in rows:
+        my = round((ry1 - ry0) * PIT_MARGIN_Y)
+        for j in range(9):
+            cx0, cx1 = vlines[j], vlines[j + 1]
+            mx = round((cx1 - cx0) * PIT_MARGIN_X)
+            gx0 = max(0, x + cx0 - mx)
+            gx1 = min(w, x + cx1 + mx)
+            gy0 = max(0, y + ry0 - my)
+            gy1 = min(h, y + ry1 + my)
+            if gx1 - gx0 < 4 or gy1 - gy0 < 4:
+                continue
+            pit_index = 9 - j if owner == "B" else j + 1
+            cells.append(Cell(
+                checkpoint, owner, (gx0, gy0, gx1 - gx0, gy1 - gy0),
+                Image.fromarray(gray[gy0:gy1, gx0:gx1]),
+                kind="pit", pit_index=pit_index,
+            ))
+    return cells
+
+
+def extract_diagram_cells(sheet: Image.Image) -> list[Cell]:
+    """All board-diagram cells from the 8 summary strips between table bands.
+
+    After every 10 moves the scorer fills a small board diagram: the box
+    protruding ABOVE the strip is the Kost. (Black) kazan, the box BELOW is
+    the Bast. (White) kazan, and the 2x9 grid between them holds the pit
+    counts ('x' = tuzdyk, '-' = 0, or a 1-2 digit number). Returned as Cell
+    objects with move_no = the checkpoint move (10, 20, ... 80), kind
+    "kazan"/"pit", side "B"/"W" (row owner for pits) and pit_index 1-9.
     """
     gray = np.asarray(sheet)
     h, w = gray.shape
     mask = _grid_mask(gray)
-    table_area = float(np.median([cv2.contourArea(q) for q in _find_table_quads(gray)]))
+    quads = _find_table_quads(gray)
+    table_area = float(np.median([cv2.contourArea(q) for q in quads]))
 
+    # Diagram strips are located by table position, not by enumeration order:
+    # the strip for checkpoint 10*(4*band + col + 1) sits below table `col` of
+    # band `band`, in the gap under that band. Handwriting sometimes bridges
+    # neighboring strips into one connected component, so wide components are
+    # kept and carved by each table's x-range.
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-    strips = [
+    components = [
         tuple(int(v) for v in stats[i][:4])
         for i in range(1, n)
-        if stats[i][2] > w * 0.1
+        if stats[i][2] > w * 0.05
         and h * 0.02 < stats[i][3] < h * 0.12
         and stats[i][2] > 1.5 * stats[i][3]
-        and stats[i][2] * stats[i][3] < 0.9 * table_area
+        and stats[i][2] * stats[i][3] < 2.5 * table_area
     ]
-    strips.sort(key=lambda b: (b[1] > h / 2, b[0]))  # band, then left-to-right
+
+    top_quads, bottom_quads = quads[:4], quads[4:]
+    zones = (
+        (top_quads, (max(q[:, 1].max() for q in top_quads),
+                     min(q[:, 1].min() for q in bottom_quads))),
+        (bottom_quads, (max(q[:, 1].max() for q in bottom_quads), h)),
+    )
+
+    strips: list[tuple[int, tuple[int, int, int, int]]] = []
+    for band, (band_quads, (zy0, zy1)) in enumerate(zones):
+        for col, quad in enumerate(band_quads):
+            tx0, tx1 = float(quad[:, 0].min()), float(quad[:, 0].max())
+            parts = []
+            for cx, cy, cw, ch in components:
+                yc = cy + ch / 2
+                overlap = min(cx + cw, tx1) - max(cx, tx0)
+                if zy0 < yc < zy1 and overlap > 0.3 * (tx1 - tx0):
+                    parts.append((cx, cy, cw, ch))
+            if not parts:
+                continue
+            pad = int(0.02 * w)
+            sx0 = max(int(tx0) - pad, min(cx for cx, *_ in parts))
+            sx1 = min(int(tx1) + pad, max(cx + cw for cx, _, cw, _ in parts))
+            sy0 = min(cy for _, cy, *_ in parts)
+            sy1 = max(cy + ch for _, cy, _, ch in parts)
+            checkpoint = (band * 4 + col + 1) * 10
+            strips.append((checkpoint, (sx0, sy0, sx1 - sx0, sy1 - sy0)))
 
     cells: list[Cell] = []
-    for k, (x, y, bw, bh) in enumerate(strips[:8]):
-        checkpoint = (k + 1) * 10
+    for checkpoint, (x, y, bw, bh) in strips:
+        cells.extend(_strip_pit_grid(mask, gray, (x, y, bw, bh), checkpoint))
         sub = mask[y : y + bh, x : x + bw]
         long_rows = np.where((sub > 0).sum(axis=1) > bw * 0.55)[0]
         if len(long_rows) == 0:
@@ -245,6 +368,7 @@ def extract_kazan_cells(sheet: Image.Image) -> list[Cell]:
             cells.append(Cell(
                 checkpoint, side, (cx0, cy0, cx1 - cx0, cy1 - cy0),
                 Image.fromarray(gray[cy0:cy1, cx0:cx1]),
+                kind="kazan",
             ))
     return cells
 
@@ -281,9 +405,19 @@ def clean_cell(image: Image.Image) -> tuple[Image.Image, float]:
     return Image.fromarray(cleaned), ink_ratio
 
 
-def render_overlay(sheet: Image.Image, cells: list[Cell], labels: dict | None = None) -> Image.Image:
-    """Debug image: cell boxes (green) with optional predicted labels (red)."""
+def render_overlay(sheet: Image.Image, cells: list[Cell], labels: dict | None = None,
+                   diagram_cells: list[Cell] | None = None,
+                   diagram_labels: dict | None = None,
+                   gridlines: list | None = None) -> Image.Image:
+    """Debug image: move-cell boxes (green) with predicted labels (red),
+    kazan boxes (blue), pit cells (orange) with their reads, and the
+    segmentation gridlines (gray).
+
+    `diagram_labels` is keyed by (move_no, kind, side, pit_index).
+    """
     vis = cv2.cvtColor(np.asarray(sheet), cv2.COLOR_GRAY2BGR)
+    for p0, p1 in gridlines or []:
+        cv2.line(vis, p0, p1, (160, 160, 160), 1, cv2.LINE_AA)
     for cell in cells:
         x, y, w, h = cell.bbox
         if cell.quad is not None:
@@ -295,4 +429,13 @@ def render_overlay(sheet: Image.Image, cells: list[Cell], labels: dict | None = 
             if text:
                 cv2.putText(vis, text, (x + 2, y + h - 3),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+    for cell in diagram_cells or []:
+        x, y, w, h = cell.bbox
+        color = (200, 120, 0) if cell.kind == "kazan" else (0, 140, 255)  # BGR
+        cv2.rectangle(vis, (x, y), (x + w, y + h), color, 1)
+        if diagram_labels:
+            text = diagram_labels.get((cell.move_no, cell.kind, cell.side, cell.pit_index))
+            if text:
+                cv2.putText(vis, text, (x + 1, y + h - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
     return Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))

@@ -18,6 +18,10 @@ CLASSES = MOVES + [EMPTY]
 CLASS_TO_IDX = {name: i for i, name in enumerate(CLASSES)}
 NUM_CLASSES = len(CLASSES)  # 163
 
-# Kazan checkpoint numbers on the scoresheet summary strips: always exactly
-# two digits (with leading zero), values 00-81, never an 'x'.
-KAZAN_CLASSES = [f"{v:02d}" for v in range(82)] + [EMPTY]
+# Unified board-diagram classes for the summary strips: pit/kazan values
+# 0-81 (rendered as 1 or 2 digits), 'x' = tuzdyk mark, '-' = zero mark.
+# At inference the pipeline filters per context: kazan boxes allow only
+# 10-81, pit cells allow '-', 'x' and 0-81.
+DASH = "-"
+TUZDYK = "x"
+DIAGRAM_CLASSES = [str(v) for v in range(82)] + [TUZDYK, DASH, EMPTY]

@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from togyz.classes import CLASSES, KAZAN_CLASSES
+from togyz.classes import CLASSES, DIAGRAM_CLASSES
 from togyz.dataset import RealCropDataset, SyntheticCellDataset
 from togyz.model import auto_device, build_model, save_checkpoint
 
@@ -52,9 +52,11 @@ def evaluate_real(model, real: RealCropDataset, device) -> tuple[float, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=["moves", "kazan"], default="moves",
-                        help="moves: 163-class cell classifier; kazan: 00-81 "
-                             "checkpoint numbers from the summary strips")
+    parser.add_argument("--task", choices=["moves", "diagram"], default="moves",
+                        help="moves: 163-class cell classifier; diagram: unified "
+                             "board-diagram reader (0-81, 'x', '-') for the kazan "
+                             "boxes and pit cells of the summary strips "
+                             "(replaces the old 'kazan' task)")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--samples-per-epoch", type=int, default=50_000)
     parser.add_argument("--val-size", type=int, default=4_000)
@@ -63,7 +65,7 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out", default=None,
-                        help="default: checkpoints (moves) / checkpoints/kazan")
+                        help="default: checkpoints (moves) / checkpoints/diagram")
     parser.add_argument("--resume", default=None, help="path to last.pt to continue")
     parser.add_argument("--device", default=None, help="cuda / mps / cpu (default: auto)")
     args = parser.parse_args()
@@ -71,13 +73,16 @@ def main() -> None:
     device = torch.device(args.device) if args.device else auto_device()
     print(f"Device: {device}, task: {args.task}")
 
-    classes = KAZAN_CLASSES if args.task == "kazan" else CLASSES
-    out_dir = Path(args.out or ("checkpoints/kazan" if args.task == "kazan" else "checkpoints"))
+    classes = DIAGRAM_CLASSES if args.task == "diagram" else CLASSES
+    out_dir = Path(args.out or ("checkpoints/diagram" if args.task == "diagram" else "checkpoints"))
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "classes.json").write_text(json.dumps(classes))
 
-    train_set = SyntheticCellDataset(args.samples_per_epoch, seed=None, classes=classes)
-    val_set = SyntheticCellDataset(args.val_size, seed=1234, classes=classes)
+    train_set = SyntheticCellDataset(args.samples_per_epoch, seed=None,
+                                     classes=classes, task=args.task)
+    val_set = SyntheticCellDataset(args.val_size, seed=1234,
+                                   classes=classes, task=args.task)
+    # the labeled real crops are move cells; other tasks have no real eval set
     real_set = RealCropDataset() if args.task == "moves" else RealCropDataset("/nonexistent")
     print(f"Glyph pools:\n{train_set.sampler.describe()}")
     print(f"Real eval crops: {len(real_set)}")

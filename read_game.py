@@ -30,9 +30,10 @@ def main() -> None:
     parser.add_argument("image", help="scoresheet photo")
     parser.add_argument("--onnx", default="checkpoints/best.onnx",
                         help="move classifier ONNX (with a .classes.json sidecar)")
-    parser.add_argument("--kazan-onnx", default="checkpoints/kazan/best.onnx",
-                        help="kazan-number ONNX; checkpoint matching is skipped "
-                             "if the file does not exist")
+    parser.add_argument("--diagram-onnx", default="checkpoints/diagram/best.onnx",
+                        help="board-diagram ONNX (kazan boxes + pit cells); "
+                             "checkpoint matching is skipped if the file "
+                             "does not exist")
     parser.add_argument("--out", default=None, help="output dir (default: out/<image stem>)")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--beam-width", type=int, default=1024,
@@ -52,15 +53,15 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     moves_clf = load_classifier(args.onnx)
-    kazan_clf = None
-    if Path(args.kazan_onnx).exists():
-        kazan_clf = load_classifier(args.kazan_onnx)
+    diagram_clf = None
+    if Path(args.diagram_onnx).exists():
+        diagram_clf = load_classifier(args.diagram_onnx)
     else:
-        print(f"No kazan classifier at {args.kazan_onnx} - checkpoint matching off.")
+        print(f"No diagram classifier at {args.diagram_onnx} - checkpoint matching off.")
 
     print(f"Reading {args.image} ...")
     out = run_pipeline(
-        args.image, moves_clf, kazan_clf,
+        args.image, moves_clf, diagram_clf,
         result=args.result, topk=args.topk,
         beam_width=args.beam_width, per_ply=args.beam_top,
         temperature=args.temperature, tta=not args.no_tta,
@@ -71,9 +72,13 @@ def main() -> None:
         print(f"WARNING: median cell height is only {out['median_cell_height']}px - "
               "accuracy suffers at this resolution; re-photograph at full camera "
               "resolution if possible.")
-    if out["kazan_report"]:
-        print("Kazan checkpoints read: "
-              f"{[(r['move'], r['side'], r['read']) for r in out['kazan_report']]}")
+    if out["checkpoint_report"]:
+        kaz = [(r["move"], r["side"], r["read"])
+               for r in out["checkpoint_report"] if r["kind"] == "kazan"]
+        pits = sum(1 for r in out["checkpoint_report"] if r["kind"] == "pit")
+        print(f"Diagram checkpoints read: kazans {kaz}, {pits} pit cells")
+    for warning in out["warnings"]:
+        print(f"WARNING: {warning}")
 
     result = {"image": args.image, "onnx": args.onnx, **out["game_json"]}
     (out_dir / "game.json").write_text(json.dumps(result, indent=1))

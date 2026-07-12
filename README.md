@@ -19,16 +19,20 @@ records, and a **Gradio demo** (`app.py`) packages it for a HuggingFace Space.
 
 ## Live demo (HuggingFace Space)
 
-`app.py` is a Gradio app: upload up to **5** scoresheet photos, optionally tag
-each game's known result, and download the reconstructed PGNs (beam / raw /
-legal) as a zip. Inference runs on the exported **ONNX** models (torch-free),
-so the Space needs only the light serving deps in `requirements.txt`.
+`app.py` is a Gradio app: upload up to **5** scoresheet photos of one round as
+a single batch, describe the tournament (`Tournament,Location,Date,Round`) and
+each game (`WhiteName,BlackName,Result,WhiteTime,BlackTime`, one CSV line per
+image) in two text fields, pick a beam width (1024 … 2^30; oversized requests
+are trimmed to fit memory), and download the reconstructed PGNs (beam / raw /
+legal, with PGN tags) as a zip. Inference runs on the exported **ONNX** models
+(torch-free), so the Space needs only the light serving deps in
+`requirements.txt`.
 
 ```bash
 python scripts/export_onnx.py     # checkpoints/*.pt -> single-file .onnx (+ .classes.json)
 cp checkpoints/best.onnx checkpoints/best.classes.json models/
-cp checkpoints/kazan/best.onnx models/kazan.onnx
-cp checkpoints/kazan/best.classes.json models/kazan.classes.json
+cp checkpoints/diagram/best.onnx models/diagram.onnx
+cp checkpoints/diagram/best.classes.json models/diagram.classes.json
 python app.py                     # serve locally at http://127.0.0.1:7860
 ```
 
@@ -85,12 +89,15 @@ A real training run needs a GPU — see Colab below. Defaults
 Open `notebooks/colab_train.ipynb` in Colab, or manually:
 
 ```bash
-git clone <this-repo> && cd 9OCR        # or upload a zip of the project
-pip install -r requirements.txt
+git clone https://github.com/ansarzeinulla/9OCR.git && cd 9OCR
+pip install -r requirements-train.txt
 python scripts/get_glyphs.py --emnist   # ingredients/ is gitignored, so also
                                         # rebuild the EMNIST pool from torchvision
-python train.py --epochs 30
-# download checkpoints/best.pt when done
+python train.py --task moves --epochs 30
+python train.py --task diagram --epochs 30
+python scripts/export_onnx.py
+# download checkpoints/best.onnx (+.classes.json) and
+# checkpoints/diagram/best.onnx (+.classes.json) when done
 ```
 
 `predict.py`/`eval.py` run anywhere (CPU is fine) with the downloaded
@@ -117,11 +124,15 @@ Pass `--result` (1-0 / 0-1 / draw, from the sheet footer) when known: the
 beam's final pool is re-ranked to prefer reconstructions whose end state is
 consistent with how the game actually ended.
 
-The summary strips between the tables record both kazan counts every 10
-moves (Black's box above the strip, White's below, always two digits 00-81).
-A second classifier reads them (`python train.py --task kazan`, saved to
-`checkpoints/kazan/best.pt`) and the beam gains likelihood when a
-hypothesis' computed kazans match these written checkpoints.
+The summary strips between the tables hold a full board diagram every 10
+moves: both kazan counts (Black's box above the strip, White's below, two
+digits 10-81) **and** the 2×9 pit grid (upper row = Black, pits 9…1
+left-to-right; lower row = White, pits 1…9; each cell is `x` = tuzdyk,
+`-` = 0, or a 1-2 digit count). A second, unified classifier reads all of it
+(`python train.py --task diagram`, saved to `checkpoints/diagram/best.pt`;
+classes 0-81 + `x` + `-` + `empty`, filtered per context at inference), and
+the beam gains likelihood when a hypothesis' computed kazans and pit counts
+match these written checkpoints.
 
 Finds the 8 printed move tables, classifies every cell, and writes:
 

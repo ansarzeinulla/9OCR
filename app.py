@@ -1,8 +1,9 @@
 """Gradio demo for the Togyzkumalak scoresheet reader (HuggingFace Space).
 
-Upload up to 5 scoresheet photos, optionally tag each with its known result,
-and download the reconstructed PGNs. Inference runs on the exported ONNX
-models (torch-free) via `togyz.pipeline.run_pipeline`.
+Upload up to 5 scoresheet photos of one round as a single batch, describe the
+tournament and the games in two CSV text fields, and download the
+reconstructed PGNs (with proper PGN tags). Inference runs on the exported
+ONNX models (torch-free) via `togyz.pipeline.run_pipeline`.
 
 This is a demo, not production: state is per-session, work is capped at 5
 images per run, and requests are serialized through Gradio's queue so a shared
@@ -26,6 +27,8 @@ except Exception as e:
     print(f"[app] Failed to apply monkey-patch: {e}", flush=True)
 # --------------------------------------
 
+import csv
+import io
 import os
 import tempfile
 import zipfile
@@ -52,16 +55,29 @@ from togyz.pipeline import load_classifier, run_pipeline
 
 MAX_IMAGES = 5
 MODEL_DIR = Path(__file__).parent / "models"
-RESULT_CHOICES = ["unknown", "1-0", "0-1", "draw"]
+BEAM_CHOICES = [str(2**k) for k in range(10, 31)]  # 1024 ... 2^30
+DEFAULT_BEAM = "8192"
+
+# accepted spellings of a game result -> pipeline result code
+RESULT_MAP = {
+    "": None, "*": None,
+    "1": "1-0", "1-0": "1-0",
+    "0": "0-1", "0-1": "0-1",
+    "5": "draw", "0.5-0.5": "draw", "1/2-1/2": "draw", "draw": "draw",
+}
+RESULT_TAGS = {"1-0": "1-0", "0-1": "0-1", "draw": "1/2-1/2", None: "*"}
 
 # Load the ONNX sessions once at import - warm for the whole process lifetime.
 _log(f"loading move model from {MODEL_DIR / 'best.onnx'} ...")
 _MOVES = load_classifier(MODEL_DIR / "best.onnx")
-_KAZAN = None
-_kazan_path = MODEL_DIR / "kazan.onnx"
-if _kazan_path.exists():
-    _log("loading kazan model ...")
-    _KAZAN = load_classifier(_kazan_path)
+_DIAGRAM = None
+_diagram_path = MODEL_DIR / "diagram.onnx"
+if _diagram_path.exists():
+    _log("loading diagram model ...")
+    _DIAGRAM = load_classifier(_diagram_path)
+else:
+    # the old kazan.onnx has incompatible classes - do not fall back to it
+    _log("no models/diagram.onnx - checkpoint evidence disabled")
 _log("models loaded")
 
 
@@ -70,10 +86,94 @@ def _safe_slug(text: str) -> str:
     return keep.strip("_")
 
 
-def _process_one(image_path, result_choice, base_name, out_dir: Path):
-    """Run the pipeline on one image; return (row, gallery_item, pgn_files)."""
-    result = None if result_choice in (None, "unknown") else result_choice
-    out = run_pipeline(image_path, _MOVES, _KAZAN, result=result)
+def _csv_fields(line: str) -> list[str]:
+    """One CSV line -> stripped fields (handles quoted commas)."""
+    rows = list(csv.reader(io.StringIO(line)))
+    return [f.strip() for f in rows[0]] if rows else []
+
+
+def _parse_meta(text: str) -> dict:
+    """Shared metadata line: Tournament,Location,Date,Round (all optional)."""
+    fields = _csv_fields((text or "").strip())
+    if len(fields) > 4:
+        raise gr.Error(
+            "Metadata must be one CSV line: Tournament,Location,Date,Round "
+            f"(got {len(fields)} fields). Quote fields that contain commas."
+        )
+    fields += [""] * (4 - len(fields))
+    meta = {"event": fields[0], "site": fields[1], "date": fields[2],
+            "round": fields[3]}
+    if meta["round"]:
+        try:
+            rnd = int(meta["round"])
+        except ValueError:
+            raise gr.Error(f"Round must be a number 1-20, got {meta['round']!r}.")
+        if not 1 <= rnd <= 20:
+            raise gr.Error(f"Round must be between 1 and 20, got {rnd}.")
+        meta["round"] = str(rnd)
+    return meta
+
+
+def _parse_games(text: str, n_images: int) -> list[dict]:
+    """Per-game lines: WhiteName,BlackName,Result,WhiteTime,BlackTime.
+
+    One line per uploaded image, in order. Fewer lines than images is fine
+    (missing games get empty metadata); more lines is an error.
+    """
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if len(lines) > n_images:
+        raise gr.Error(
+            f"{len(lines)} game lines for {n_images} image(s). "
+            "Provide at most one line per uploaded image, in order."
+        )
+    games = []
+    for lineno, line in enumerate(lines, start=1):
+        fields = _csv_fields(line)
+        if len(fields) > 5:
+            raise gr.Error(
+                f"Game line {lineno}: expected at most 5 CSV fields "
+                "(White,Black,Result,WhiteTime,BlackTime), got "
+                f"{len(fields)}. Quote fields that contain commas."
+            )
+        fields += [""] * (5 - len(fields))
+        raw_result = fields[2]
+        if raw_result not in RESULT_MAP:
+            raise gr.Error(
+                f"Game line {lineno}: unknown result {raw_result!r}. Accepted: "
+                "1 or 1-0 (White won), 0 or 0-1 (Black won), "
+                "5 / 0.5-0.5 / 1/2-1/2 (draw), or empty."
+            )
+        games.append({"white": fields[0], "black": fields[1],
+                      "result": RESULT_MAP[raw_result],
+                      "white_time": fields[3], "black_time": fields[4]})
+    games += [{"white": "", "black": "", "result": None,
+               "white_time": "", "black_time": ""}] * (n_images - len(games))
+    return games
+
+
+def _pgn_tags(meta: dict, game: dict) -> str:
+    """Standard PGN tag section from the shared + per-game metadata."""
+    tags = [
+        ("Event", meta["event"] or "?"),
+        ("Site", meta["site"] or "?"),
+        ("Date", meta["date"] or "?"),
+        ("Round", meta["round"] or "?"),
+        ("White", game["white"] or "?"),
+        ("Black", game["black"] or "?"),
+        ("Result", RESULT_TAGS[game["result"]]),
+    ]
+    if game["white_time"]:
+        tags.append(("WhiteClock", game["white_time"]))
+    if game["black_time"]:
+        tags.append(("BlackClock", game["black_time"]))
+    return "".join(f'[{k} "{v}"]\n' for k, v in tags) + "\n"
+
+
+def _process_one(image_path, game: dict, meta: dict, beam_width: int,
+                 base_name: str, out_dir: Path):
+    """Run the pipeline on one image; return (row, gallery_item, files, warnings)."""
+    out = run_pipeline(image_path, _MOVES, _DIAGRAM,
+                       result=game["result"], beam_width=beam_width)
 
     stop = out["stopped"]
     stop_txt = stop.get("reason", "")
@@ -81,53 +181,62 @@ def _process_one(image_path, result_choice, base_name, out_dir: Path):
         stop_txt += f" ({stop['winner']})"
     note = " ⚠ low-res" if out["low_resolution"] else ""
 
+    tags = _pgn_tags(meta, game)
     files = []
     for kind in ("beam", "raw", "legal"):
         f = out_dir / f"{base_name}_{kind}.pgn"
-        f.write_text(out[f"{kind}_pgn"])
+        f.write_text(tags + out[f"{kind}_pgn"])
         files.append(str(f))
 
     row = [base_name, out["beam_plies"], stop_txt + note, out["beam_pgn"].strip()]
     caption = f"{base_name}: {out['beam_plies']} plies"
-    return row, (out["annotated_image"], caption), files
+    warnings = [f"{base_name}: {w}" for w in out["warnings"]]
+    return row, (out["annotated_image"], caption), files, warnings
 
 
-def convert(round_label, *slot_values):
-    """slot_values = [img1, res1, img2, res2, ...] for the 5 fixed slots."""
-    images = slot_values[0::2]
-    results = slot_values[1::2]
-    provided = [(img, res) for img, res in zip(images, results) if img]
-
-    if not provided:
+def convert(meta_text, games_text, beam_choice, img1, img2, img3, img4, img5):
+    """One batch: up to 5 images sharing tournament metadata."""
+    images = [img for img in (img1, img2, img3, img4, img5) if img]
+    if not images:
         raise gr.Error("Please upload at least one scoresheet image.")
-    if len(provided) > MAX_IMAGES:  # defensive; the UI only exposes 5 slots
-        raise gr.Error(f"This demo handles at most {MAX_IMAGES} images per run.")
+
+    # parse everything up front - all input errors surface before any heavy work
+    meta = _parse_meta(meta_text)
+    games = _parse_games(games_text, len(images))
+    try:
+        beam_width = int(beam_choice)
+    except (TypeError, ValueError):
+        beam_width = int(DEFAULT_BEAM)
 
     out_dir = Path(tempfile.mkdtemp(prefix="togyz_"))
-    round_slug = _safe_slug(round_label)
-    rows, gallery, all_files = [], [], []
+    round_slug = _safe_slug(meta["round"])
+    rows, gallery, all_files, all_warnings = [], [], [], []
 
-    for i, (img, res) in enumerate(provided, start=1):
-        prefix = f"{round_slug}_table{i}" if round_slug else f"table{i}"
+    for i, (img, game) in enumerate(zip(images, games), start=1):
+        prefix = f"round{round_slug}_game{i}" if round_slug else f"game{i}"
         try:
-            row, gal, files = _process_one(img, res, prefix, out_dir)
+            row, gal, files, warns = _process_one(
+                img, game, meta, beam_width, prefix, out_dir
+            )
         except Exception as exc:  # one bad image must not kill the batch
             rows.append([prefix, 0, f"error: {exc}", ""])
             continue
         rows.append(row)
         gallery.append(gal)
         all_files.extend(files)
+        all_warnings.extend(warns)
 
+    warnings_md = "\n".join(f"⚠ {w}" for w in dict.fromkeys(all_warnings))
     if not all_files:
         # every image errored - still return the table so the user sees why
-        return rows, gallery, None
+        return rows, gallery, None, warnings_md
 
-    zip_path = out_dir / (f"{round_slug}_pgns.zip" if round_slug else "pgns.zip")
+    zip_path = out_dir / (f"round{round_slug}_pgns.zip" if round_slug else "pgns.zip")
     with zipfile.ZipFile(zip_path, "w") as zf:
         for f in all_files:
             zf.write(f, arcname=Path(f).name)
 
-    return rows, gallery, str(zip_path)
+    return rows, gallery, str(zip_path), warnings_md
 
 
 def _busy_wrapper(*args):
@@ -146,22 +255,35 @@ def _busy_wrapper(*args):
 with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
     gr.Markdown(
         "# Togyzkumalak Scoresheet Reader\n"
-        "Upload up to **5** scoresheet photos, optionally tag each game's known "
-        "result (improves accuracy), then **Convert** to download the PGNs.\n\n"
+        "Upload up to **5** scoresheet photos of one round as a single batch, "
+        "describe the round and the games in the two text fields, then "
+        "**Convert** to download the PGNs.\n\n"
         "Outputs per game: `beam` (best legal reconstruction), `raw` (pure OCR), "
         "`legal` (strict replay). Free demo — a first run may wake the Space, and "
         "images are processed one at a time."
     )
-    round_label = gr.Textbox(label="Round (optional)", placeholder="e.g. 3",
-                             scale=1, max_lines=1)
+    meta_box = gr.Textbox(
+        label="Tournament metadata (CSV): Tournament,Location,Date,Round — all optional",
+        placeholder="World Championship among boys, Astana city, 2026 7 July, 7",
+        max_lines=1,
+    )
+    games_box = gr.Textbox(
+        label="Games (one CSV line per image, in order): "
+              "WhiteName,BlackName,Result,WhiteTime,BlackTime — all optional; "
+              "Result: 1 / 1-0, 0 / 0-1, 5 / 0.5-0.5 / 1/2-1/2",
+        placeholder="Zhanabay Korkem, Kubzhasar Marhabat, 0-1, 0:07:55, 0:24:05",
+        lines=MAX_IMAGES,
+    )
+    beam_dd = gr.Dropdown(
+        BEAM_CHOICES, value=DEFAULT_BEAM,
+        label="Beam width (game hypotheses kept; larger = slower but more "
+              "thorough; very large values are trimmed to fit memory)",
+    )
 
-    slots = []
-    for i in range(MAX_IMAGES):
-        with gr.Row():
-            img = gr.Image(label=f"Table {i + 1}", type="filepath", height=150)
-            res = gr.Dropdown(RESULT_CHOICES, value="unknown",
-                              label="Result (1-0 = White won)", scale=1)
-        slots.extend([img, res])
+    image_slots = [
+        gr.Image(label=f"Game {i + 1}", type="filepath", height=150)
+        for i in range(MAX_IMAGES)
+    ]
 
     convert_btn = gr.Button("Convert", variant="primary")
 
@@ -169,13 +291,14 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
         headers=["game", "legal plies", "stopped", "beam PGN"],
         label="Results", wrap=True, interactive=False,
     )
+    warnings_md = gr.Markdown()
     gallery = gr.Gallery(label="Annotated reconstruction", columns=2, height="auto")
     zip_out = gr.File(label="Download all PGNs (zip)")
 
     convert_btn.click(
         _busy_wrapper,
-        inputs=[round_label, *slots],
-        outputs=[results_table, gallery, zip_out],
+        inputs=[meta_box, games_box, beam_dd, *image_slots],
+        outputs=[results_table, gallery, zip_out, warnings_md],
     )
 
 # Serialize CPU-heavy runs: callers wait in a bounded queue instead of

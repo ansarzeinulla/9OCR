@@ -2,7 +2,7 @@
 
 This is the single inference core shared by the CLI (`read_game.py`) and the
 Gradio demo (`app.py`). It deliberately imports **no torch**: the move and
-kazan classifiers run as ONNX sessions, and every array op is numpy. The
+board-diagram classifiers run as ONNX sessions, and every array op is numpy. The
 heavy lifting of cell extraction (`togyz.sheet`) and the rules engine
 (`togyz.rules`) are already torch-free and imported as-is.
 
@@ -13,6 +13,7 @@ git history (sheet 1 = 36/39 exact plies). Keep it numerically equivalent.
 
 from __future__ import annotations
 
+import heapq
 import json
 import math
 from dataclasses import dataclass, field
@@ -22,10 +23,10 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-from .classes import EMPTY
+from .classes import DASH, EMPTY, TUZDYK
 from .preprocess import preprocess_pil
 from .rules import Game
-from .sheet import clean_cell, extract_cells, extract_kazan_cells, render_overlay
+from .sheet import clean_cell, extract_cells, extract_diagram_cells, render_overlay
 
 MIN_CELL_HEIGHT = 35  # px; below this, resolution is low (surfaced as a warning)
 MIN_INK_RATIO = 0.02  # cells with less handwriting ink than this are empty
@@ -36,7 +37,15 @@ TTA_SHIFTS = [(0, 0), (-2, 0), (2, 0), (0, -2), (0, 2), (-2, -2), (2, 2)]
 EXACT_WEIGHT = 0.5  # weight of the exact class-string probability
 FACTOR_WEIGHT = 0.5  # weight of the factorized digit-marginal probability
 KAZAN_FLOOR = 1e-4  # a misread checkpoint must not single-handedly kill truth
+PIT_FLOOR = 1e-3  # pit reads are noisier than kazans: weaker veto power
+PIT_WEIGHT = 0.5  # 18 pit terms per checkpoint must not swamp the rest
 RESULT_CODES = {"1-0": 0, "0-1": 1, "draw": -1}
+
+# Memory guard for user-selectable beam widths (the UI offers up to 2^30):
+# a late-game hypothesis (copied move lists etc.) costs roughly this many
+# bytes, and the expanded pool peaks at beam_width * per_ply hypotheses.
+HYPOTHESIS_BYTES = 25_000
+MAX_POOL_BYTES = 2 * 2**30  # ~2 GB hypothesis budget
 
 
 # --------------------------------------------------------------------------- #
@@ -152,27 +161,66 @@ def _result_consistency(game: Game, result: str | None) -> int:
     return 1 if leader == want else 0
 
 
-def _kazan_logp(game: Game, checkpoint_probs) -> float:
-    """Log-likelihood of a hypothesis' kazan counts under the checkpoint reads."""
+def _filter_probs(probs: np.ndarray, classes: list[str], allowed: set[str]):
+    """Zero out contextually impossible classes and renormalize.
+
+    Returns None when nothing observable remains (e.g. a blank crop whose
+    mass sat entirely on 'empty') - the cell is then treated as unobserved.
+    """
+    filtered = np.array(
+        [p if c in allowed else 0.0 for c, p in zip(classes, probs)], np.float64
+    )
+    total = float(filtered.sum())
+    if total < 1e-6:
+        return None
+    return filtered / total
+
+
+def _diagram_logp(game: Game, cp) -> float:
+    """Log-likelihood of a hypothesis' board state under one checkpoint's
+    diagram reads (kazan boxes + observed pit cells)."""
     logp = 0.0
     for side, player in (("W", 0), ("B", 1)):
-        probs = checkpoint_probs.get(side)
+        probs = cp["kazan"].get(side)
         if probs is None:
             continue
         value = game.kazans[player]
         p = float(probs[value]) if value < len(probs) else 0.0
         logp += math.log(max(p, KAZAN_FLOOR))
+
+    for (side, index), (values, p_x, p_dash) in cp["pits"].items():
+        player = 0 if side == "W" else 1
+        pit_pos = player * 9 + (index - 1)
+        # a pit owned as tuzdyk by the opponent is written as 'x'
+        if game.tuzdyks[1 - player] == index - 1:
+            p = p_x
+        else:
+            count = game.pits[pit_pos]
+            if count == 0:
+                p = p_dash + float(values[0])
+            else:
+                p = float(values[count]) if count < len(values) else 0.0
+        logp += PIT_WEIGHT * math.log(max(p, PIT_FLOOR))
     return logp
+
+
+def safe_beam_width(beam_width: int, per_ply: int = 9) -> int:
+    """Largest beam width that keeps the expanded pool inside the RAM budget."""
+    return max(1, min(beam_width, MAX_POOL_BYTES // (HYPOTHESIS_BYTES * max(per_ply, 1))))
 
 
 def beam_decode(ply_probs, classes, beam_width=1024, per_ply=9, result=None,
                 checkpoints=None):
     """Longest fully-legal move sequence with the highest joint probability,
     exploring all `per_ply` legal continuations per ply; the final pool is
-    re-ranked by kazan-checkpoint and known-result consistency.
+    re-ranked by diagram-checkpoint and known-result consistency.
+
+    `beam_width` is capped by `safe_beam_width` so user-requested widths up
+    to 2^30 degrade into a narrower beam instead of exhausting RAM.
 
     Returns (annotated_moves, log_prob, per_ply_share_list).
     """
+    beam_width = safe_beam_width(beam_width, per_ply)
     checkpoints = checkpoints or {}
     class_idx = {c: i for i, c in enumerate(classes)}
     active = [(Game(), [], [], 0.0)]  # (game, annotated_moves, chosen_shares, logp)
@@ -188,12 +236,13 @@ def beam_decode(ply_probs, classes, beam_width=1024, per_ply=9, result=None,
                 annotated = played.notation + ("+" if played.captured else "")
                 new_logp = logp + math.log(max(raw, 1e-12))
                 if len(moves) + 1 in checkpoints:
-                    new_logp += _kazan_logp(nxt, checkpoints[len(moves) + 1])
+                    new_logp += _diagram_logp(nxt, checkpoints[len(moves) + 1])
                 hyp = (nxt, moves + [annotated], chosen + [share], new_logp)
                 (finished if nxt.is_over else expanded).append(hyp)
         if not expanded:
             break
-        active = sorted(expanded, key=lambda h: -h[3])[:beam_width]
+        # nlargest instead of a full sort: wide beams stay tractable
+        active = heapq.nlargest(beam_width, expanded, key=lambda h: h[3])
 
     pool = active + finished
     best = max(pool, key=lambda h: (len(h[1]), _result_consistency(h[0], result), h[3]))
@@ -212,8 +261,8 @@ def format_pgn(plies: list[str]) -> str:
 # --------------------------------------------------------------------------- #
 # The single entry point
 # --------------------------------------------------------------------------- #
-def run_pipeline(image, moves_clf: Classifier, kazan_clf: Classifier | None = None,
-                 result=None, topk=5, beam_width=1024, per_ply=9,
+def run_pipeline(image, moves_clf: Classifier, diagram_clf: Classifier | None = None,
+                 result=None, topk=5, beam_width=8192, per_ply=9,
                  temperature=1.0, tta=True, save_cells_dir=None):
     """Read one scoresheet image into game records.
 
@@ -222,13 +271,20 @@ def run_pipeline(image, moves_clf: Classifier, kazan_clf: Classifier | None = No
     (the CLI uses it, the Gradio app does not).
 
     Keys: beam_pgn, raw_pgn, legal_pgn, game_json (dict), stopped,
-    plies_scanned, legal_plies, beam_plies, kazan_report, annotated_image (PIL),
-    median_cell_height, low_resolution (bool).
+    plies_scanned, legal_plies, beam_plies, checkpoint_report, warnings,
+    annotated_image (PIL), median_cell_height, low_resolution (bool).
     """
     classes = moves_clf.classes
     empty_idx = classes.index(EMPTY)
+    warnings: list[str] = []
+    effective_width = safe_beam_width(beam_width, per_ply)
+    if effective_width < beam_width:
+        warnings.append(
+            f"beam width {beam_width} trimmed to {effective_width} to stay "
+            "inside the memory budget"
+        )
 
-    cells, sheet = extract_cells(image)
+    cells, sheet, gridlines = extract_cells(image, with_gridlines=True)
     cells.sort(key=lambda c: (c.move_no, c.side != "W"))  # game order: 1W 1B 2W ...
     median_h = sorted(c.bbox[3] for c in cells)[len(cells) // 2]
 
@@ -294,31 +350,62 @@ def run_pipeline(image, moves_clf: Classifier, kazan_clf: Classifier | None = No
                 in_sync = False
             raw_pgn.append(raw)
 
-    # kazan checkpoint numbers from the summary strips (every 10 moves)
+    # board-diagram evidence from the summary strips (every 10 moves):
+    # kazan boxes (values 10-81) plus the 2x9 pit grid ('x'/'-'/0-81)
     checkpoints, checkpoint_report = {}, []
-    if kazan_clf is not None:
-        kz_cells = [(c, *clean_cell(c.image)) for c in extract_kazan_cells(sheet)]
-        kz_cells = [(c, img) for c, img, ink in kz_cells if ink >= MIN_KAZAN_INK]
-        if kz_cells:
-            kz_probs = classify_cells(
-                [img for _, img in kz_cells], kazan_clf,
+    diagram_cells, diagram_labels = [], {}
+    if diagram_clf is not None:
+        dg_classes = diagram_clf.classes
+        value_names = [str(v) for v in range(82)]
+        kazan_allowed = set(str(v) for v in range(10, 82))
+        pit_allowed = set(value_names) | {TUZDYK, DASH}
+        x_idx = dg_classes.index(TUZDYK)
+        dash_idx = dg_classes.index(DASH)
+
+        dg_cells = [(c, *clean_cell(c.image)) for c in extract_diagram_cells(sheet)]
+        dg_cells = [
+            (c, img) for c, img, ink in dg_cells
+            if ink >= (MIN_KAZAN_INK if c.kind == "kazan" else MIN_INK_RATIO)
+        ]
+        if dg_cells:
+            dg_probs = classify_cells(
+                [img for _, img in dg_cells], diagram_clf,
                 temperature=temperature, tta=tta,
             )
-            for (cell, img), probs in zip(kz_cells, kz_probs):
-                if kazan_clf.classes[int(np.argmax(probs))] == EMPTY:
+            for (cell, img), probs in zip(dg_cells, dg_probs):
+                if dg_classes[int(np.argmax(probs))] == EMPTY:
                     continue
-                values = probs[:82] / max(float(probs[:82].sum()), 1e-9)
-                checkpoints.setdefault(cell.move_no * 2, {})[cell.side] = values
-                top = int(np.argmax(values))
-                checkpoint_report.append(
-                    {"move": cell.move_no, "side": cell.side,
-                     "read": f"{top:02d}", "prob": round(float(values[top]), 4)}
+                allowed = kazan_allowed if cell.kind == "kazan" else pit_allowed
+                filtered = _filter_probs(probs, dg_classes, allowed)
+                if filtered is None:
+                    continue
+                cp = checkpoints.setdefault(
+                    cell.move_no * 2, {"kazan": {}, "pits": {}}
                 )
+                values = filtered[:82]
+                top_idx = int(np.argmax(filtered))
+                read = dg_classes[top_idx]
+                if cell.kind == "kazan":
+                    # renormalized over 10-81 only, value-indexed for scoring
+                    cp["kazan"][cell.side] = values / max(float(values.sum()), 1e-9)
+                else:
+                    cp["pits"][(cell.side, cell.pit_index)] = (
+                        values, float(filtered[x_idx]), float(filtered[dash_idx])
+                    )
+                diagram_cells.append(cell)
+                diagram_labels[(cell.move_no, cell.kind, cell.side, cell.pit_index)] = read
+                entry = {"move": cell.move_no, "kind": cell.kind, "side": cell.side,
+                         "read": read, "prob": round(float(filtered[top_idx]), 4)}
+                if cell.kind == "pit":
+                    entry["index"] = cell.pit_index
+                checkpoint_report.append(entry)
                 if cells_dir:
-                    img.save(cells_dir / f"kazan_{cell.move_no:02d}_{cell.side}.png")
+                    suffix = f"_{cell.pit_index}" if cell.kind == "pit" else ""
+                    img.save(cells_dir /
+                             f"{cell.kind}_{cell.move_no:02d}_{cell.side}{suffix}.png")
 
     beam_moves, beam_logp, beam_shares = beam_decode(
-        ply_prob_arrays, classes, beam_width, per_ply,
+        ply_prob_arrays, classes, effective_width, per_ply,
         result=result, checkpoints=checkpoints,
     )
     beam_detail = [
@@ -329,14 +416,19 @@ def run_pipeline(image, moves_clf: Classifier, kazan_clf: Classifier | None = No
     for p, m in zip(plies, beam_moves):
         labels[(p["move"], p["side"])] = m
 
-    annotated = render_overlay(sheet, cells[: len(plies)], labels)
+    annotated = render_overlay(
+        sheet, cells[: len(plies)], labels,
+        diagram_cells=diagram_cells, diagram_labels=diagram_labels,
+        gridlines=gridlines,
+    )
 
     game_json = {
         "plies_scanned": len(plies),
         "legal_plies": len(legal_pgn),
         "beam": {"plies": len(beam_moves), "log_prob": round(beam_logp, 3), "moves": beam_detail},
-        "kazan_checkpoints": checkpoint_report,
+        "checkpoints": checkpoint_report,
         "stopped": stopped or {"reason": "sheet exhausted"},
+        "warnings": warnings,
         "plies": plies,
     }
     return {
@@ -348,7 +440,8 @@ def run_pipeline(image, moves_clf: Classifier, kazan_clf: Classifier | None = No
         "plies_scanned": len(plies),
         "legal_plies": len(legal_pgn),
         "beam_plies": len(beam_moves),
-        "kazan_report": checkpoint_report,
+        "checkpoint_report": checkpoint_report,
+        "warnings": warnings,
         "annotated_image": annotated,
         "median_cell_height": int(median_h),
         "low_resolution": median_h < MIN_CELL_HEIGHT,

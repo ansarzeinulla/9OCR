@@ -4,7 +4,7 @@
 
 Writes, next to each source checkpoint:
     checkpoints/best.onnx          + checkpoints/best.classes.json
-    checkpoints/kazan/best.onnx    + checkpoints/kazan/best.classes.json
+    checkpoints/diagram/best.onnx  + checkpoints/diagram/best.classes.json
 
 ONNX carries no Python metadata, so the class list (which maps output index
 -> move/kazan string) is saved as a JSON sidecar the serving code reads. The
@@ -66,8 +66,8 @@ def main() -> None:
     parser.add_argument(
         "checkpoints",
         nargs="*",
-        default=["checkpoints/best.pt", "checkpoints/kazan/best.pt"],
-        help="checkpoint(s) to export (default: moves + kazan best.pt)",
+        default=["checkpoints/best.pt", "checkpoints/diagram/best.pt"],
+        help="checkpoint(s) to export (default: moves + diagram best.pt)",
     )
     args = parser.parse_args()
     for path in args.checkpoints:
