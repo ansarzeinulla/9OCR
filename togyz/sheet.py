@@ -97,55 +97,84 @@ def _find_table_quads(gray: np.ndarray) -> list[np.ndarray]:
     bottom = sorted(quads[4:], key=lambda q: q[:, 0].mean())
     return top + bottom
 
+def _get_page_geometry(gray: np.ndarray):
+    """Phase 2 & 3: Find the outer constellation, warp the page to an orthogonal grid,
+    and calculate the Master Ruler pixel dimensions."""
+    quads = _find_table_quads(gray)
+    
+    # Phase 2: Lock the Invisible Frame using the 4 outermost corners of the 8 blocks
+    src_pts = np.array([
+        quads[0][0],   # Top-Left of Block 1
+        quads[3][1],   # Top-Right of Block 4
+        quads[7][2],   # Bottom-Right of Block 8
+        quads[4][3]    # Bottom-Left of Block 5
+    ], dtype=np.float32)
+    
+    # Measure dimensions to maintain native scale
+    w_top = np.linalg.norm(src_pts[1] - src_pts[0])
+    w_bot = np.linalg.norm(src_pts[2] - src_pts[3])
+    h_left = np.linalg.norm(src_pts[3] - src_pts[0])
+    h_right = np.linalg.norm(src_pts[2] - src_pts[1])
+    
+    tw = int(round(max(w_top, w_bot) * UPSCALE))
+    th = int(round(max(h_left, h_right) * UPSCALE))
+    
+    dst_pts = np.array([[0, 0], [tw, 0], [tw, th], [0, th]], dtype=np.float32)
+    
+    # Single global warp to make the entire page strictly 90-degrees orthogonal!
+    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    inverse = np.linalg.inv(matrix)
+    warped = cv2.warpPerspective(gray, matrix, (tw, th), flags=cv2.INTER_CUBIC)
+    
+    # Map the 8 blocks into our flat space to measure internal offsets
+    mapped_quads = [cv2.perspectiveTransform(np.array([q], np.float32), matrix)[0] for q in quads]
+    
+    # Phase 3: The Master Ruler
+    block_widths = [mq[:,0].max() - mq[:,0].min() for mq in mapped_quads]
+    block_heights = [mq[:,1].max() - mq[:,1].min() for mq in mapped_quads]
+    
+    bw = float(np.mean(block_widths))
+    bh = float(np.mean(block_heights))
+    
+    # Heights are uniform: 11 rows per block (header + 10 moves)
+    cell_h = bh / 11.0
+    
+    # Widths: Move column is 40% of block. Pit width is 1/3 of move column.
+    move_w = bw * 0.40
+    pit_w = move_w / 3.0
+    
+    # Column X Anchors (Averaged from top/bottom bands for perfect vertical lines)
+    col_xs = [float(np.mean([mapped_quads[i][:,0].min(), mapped_quads[i+4][:,0].min()])) for i in range(4)]
+    
+    # Row Y Anchors
+    top_y = float(np.mean([mq[:,1].min() for mq in mapped_quads[:4]]))
+    bot_y = float(np.mean([mq[:,1].min() for mq in mapped_quads[4:]]))
+    
+    return {
+        "warped": warped, "inverse": inverse,
+        "tw": tw, "th": th, "bw": bw, "bh": bh,
+        "cell_h": cell_h, "pit_w": pit_w,
+        "col_xs": col_xs, "top_y": top_y, "bot_y": bot_y
+    }
 
-def _detect_lines(mask: np.ndarray, axis: int, min_frac: float) -> list[int]:
-    """Positions of long line clusters along `axis` (0=rows, 1=cols)."""
-    profile = mask.sum(axis=1 - axis)
-    limit = 255 * mask.shape[1 - axis] * min_frac
-    positions = np.where(profile > limit)[0]
-    clusters: list[list[int]] = []
-    for pos in positions:
-        if clusters and pos - clusters[-1][-1] <= 2:
-            clusters[-1].append(int(pos))
-        else:
-            clusters.append([int(pos)])
-    return [int(np.mean(c)) for c in clusters]
-
+def _create_cell_from_warped(geom, cx0, cy0, cx1, cy1, move_no, side, kind="move", pit_index=0) -> Cell:
+    """Helper to crop blindly from the flat image and map coordinates back to the original photo."""
+    warped, inverse = geom["warped"], geom["inverse"]
+    th, tw = warped.shape
+    cx0, cy0 = int(max(0, cx0)), int(max(0, cy0))
+    cx1, cy1 = int(min(tw, cx1)), int(min(th, cy1))
+    
+    crop = Image.fromarray(warped[cy0:cy1, cx0:cx1])
+    corners = np.array([[cx0, cy0], [cx1, cy0], [cx1, cy1], [cx0, cy1]], np.float32).reshape(-1, 1, 2)
+    sheet_quad = cv2.perspectiveTransform(corners, inverse).reshape(4, 2)
+    
+    x_min, y_min = sheet_quad.min(axis=0)
+    x_max, y_max = sheet_quad.max(axis=0)
+    bbox = (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
+    
+    return Cell(move_no, side, bbox, crop, sheet_quad, kind=kind, pit_index=pit_index)
 
 UPSCALE = 2  # rectified tables are rendered at 2x for a little more pixel room
-
-
-def _rectify_table(gray: np.ndarray, quad: np.ndarray):
-    """Warp a (possibly tilted) table quad to a flat rectangle.
-
-    Returns (warped gray image, inverse homography back to sheet coords).
-    """
-    top = np.linalg.norm(quad[1] - quad[0])
-    bottom = np.linalg.norm(quad[2] - quad[3])
-    left = np.linalg.norm(quad[3] - quad[0])
-    right = np.linalg.norm(quad[2] - quad[1])
-    tw = int(round((top + bottom) / 2)) * UPSCALE
-    th = int(round((left + right) / 2)) * UPSCALE
-    target = np.array([[0, 0], [tw, 0], [tw, th], [0, th]], np.float32)
-    matrix = cv2.getPerspectiveTransform(quad, target)
-    warped = cv2.warpPerspective(gray, matrix, (tw, th), flags=cv2.INTER_CUBIC)
-    return warped, np.linalg.inv(matrix)
-
-
-def _row_lines(warped: np.ndarray) -> list[int]:
-    """Row separators in a rectified table; uniform fallback."""
-    h, w = warped.shape
-    thr = cv2.adaptiveThreshold(
-        warped, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 12
-    )
-    horiz = cv2.morphologyEx(
-        thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 3, 3), 1))
-    )
-    rows = _detect_lines(horiz, axis=0, min_frac=0.4)
-    if len(rows) != ROWS_PER_TABLE + 2:  # header + 10 rows needs 12 lines
-        rows = [round(i * h / (ROWS_PER_TABLE + 1)) for i in range(ROWS_PER_TABLE + 2)]
-    return rows
-
 
 def _map_segment(inverse: np.ndarray, p0, p1) -> tuple[tuple[int, int], tuple[int, int]]:
     """Map a rectified-table segment back onto the original sheet."""
@@ -158,220 +187,119 @@ def _map_segment(inverse: np.ndarray, p0, p1) -> tuple[tuple[int, int], tuple[in
 
 
 def extract_cells(image, with_gridlines: bool = False):
-    """All 160 move cells (80 moves x W/B) plus the upright sheet image.
-
-    `image` is a path (str/Path) or a PIL.Image. Each table is
-    perspective-rectified before being split, so cell crops stay aligned even
-    on tilted phone photos.
-
-    Returns (cells, sheet) or, with `with_gridlines`, (cells, sheet, gridlines)
-    where gridlines is a list of ((x0, y0), (x1, y1)) sheet-coordinate segments
-    for every row/column separator used during segmentation.
-    """
     if isinstance(image, Image.Image):
         pil = ImageOps.exif_transpose(image).convert("L")
     else:
         with Image.open(image) as img:
             pil = ImageOps.exif_transpose(img).convert("L")
+            
     gray = np.asarray(pil)
-
+    geom = _get_page_geometry(gray)
+    
     cells: list[Cell] = []
     gridlines: list[tuple[tuple[int, int], tuple[int, int]]] = []
-    for t, quad in enumerate(_find_table_quads(gray)):
-        warped, inverse = _rectify_table(gray, quad)
-        th, tw = warped.shape
-        rows = _row_lines(warped)
-        cols = [round(f * tw) for f in COLUMN_FRACTIONS]
-        if with_gridlines:
-            for y in rows:
-                gridlines.append(_map_segment(inverse, (0, y), (tw, y)))
-            for x in cols:
-                gridlines.append(_map_segment(inverse, (x, rows[0]), (x, rows[-1])))
-        for r in range(ROWS_PER_TABLE):
-            y0, y1 = rows[r + 1], rows[r + 2]  # rows[0..1] is the header
-            for col_index, side in ((1, "W"), (2, "B")):
-                x0, x1 = cols[col_index], cols[col_index + 1]
-                mx = round((x1 - x0) * CELL_MARGIN)
-                my = round((y1 - y0) * CELL_MARGIN)
-                cx0, cy0 = max(0, x0 - mx), max(0, y0 - my)
-                cx1, cy1 = min(tw, x1 + mx), min(th, y1 + my)
-                crop = Image.fromarray(warped[cy0:cy1, cx0:cx1])
-
-                # map the cell corners back onto the original sheet
-                corners = np.array(
-                    [[cx0, cy0], [cx1, cy0], [cx1, cy1], [cx0, cy1]], np.float32
-                ).reshape(-1, 1, 2)
-                sheet_quad = cv2.perspectiveTransform(corners, inverse).reshape(4, 2)
-                x_min, y_min = sheet_quad.min(axis=0)
-                x_max, y_max = sheet_quad.max(axis=0)
-                bbox = (int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min))
-                cells.append(
-                    Cell(t * ROWS_PER_TABLE + r + 1, side, bbox, crop, sheet_quad)
-                )
+    
+    for band in range(2):
+        base_y = geom["top_y"] if band == 0 else geom["bot_y"]
+        for col in range(4):
+            table_idx = band * 4 + col
+            base_x = geom["col_xs"][col]
+            
+            if with_gridlines:
+                for r in range(12):
+                    y = base_y + r * geom["cell_h"]
+                    gridlines.append(_map_segment(geom["inverse"], (base_x, y), (base_x + geom["bw"], y)))
+                for frac in COLUMN_FRACTIONS:
+                    x = base_x + geom["bw"] * frac
+                    gridlines.append(_map_segment(geom["inverse"], (x, base_y), (x, base_y + geom["bh"])))
+            
+            # Slicing 10 move rows (skipping header at r=0)
+            for r in range(10):
+                cy0 = base_y + (r + 1) * geom["cell_h"]
+                cy1 = cy0 + geom["cell_h"]
+                my = (cy1 - cy0) * CELL_MARGIN
+                
+                for side in ("W", "B"):
+                    # White starts at 20%, Black starts at 60%
+                    offset_x = geom["bw"] * (0.2 if side == "W" else 0.6)
+                    cx0 = base_x + offset_x
+                    cx1 = cx0 + geom["bw"] * 0.4
+                    mx = (cx1 - cx0) * CELL_MARGIN
+                    
+                    cells.append(_create_cell_from_warped(
+                        geom, cx0 - mx, cy0 - my, cx1 + mx, cy1 + my,
+                        table_idx * 10 + r + 1, side
+                    ))
+                    
     if with_gridlines:
         return cells, pil, gridlines
     return cells, pil
 
-
 PIT_MARGIN_Y = 0.25  # pit digits regularly overflow the printed row height
 PIT_MARGIN_X = 0.15  # and bleed a little into neighboring columns
 
-
-def _strip_pit_grid(mask: np.ndarray, gray: np.ndarray,
-                    strip_bbox: tuple[int, int, int, int], checkpoint: int) -> list[Cell]:
-    """The 18 pit cells of the 2x9 board diagram inside one summary strip.
-
-    Upper row = Kost. (Black), pit indexes 9..1 left-to-right; lower row =
-    Bast. (White), indexes 1..9. Grid lines are detected inside the strip;
-    when detection is incomplete the known uniform 2x9 structure is used.
-    """
-    x, y, bw, bh = strip_bbox
-    h, w = gray.shape
-    sub = mask[y : y + bh, x : x + bw]
-
-    # horizontal separators: top / middle / bottom of the 2x9 grid
-    hlines = _detect_lines(sub, axis=0, min_frac=0.55)
-    if len(hlines) < 2:
-        return []
-    top, bottom = hlines[0], hlines[-1]
-    if bottom - top < 6:
-        return []
-    mid_target = (top + bottom) / 2
-    inner = [v for v in hlines if top + 2 < v < bottom - 2]
-    middle = min(inner, key=lambda v: abs(v - mid_target)) if inner else int(round(mid_target))
-
-    # vertical separators: 10 column lines across the grid band
-    band = sub[top : bottom + 1]
-    vlines = _detect_lines(band, axis=1, min_frac=0.5)
-    if len(vlines) != 10:
-        if len(vlines) >= 2:
-            x0, x1 = vlines[0], vlines[-1]
-        else:
-            xs = np.where(band.sum(axis=0) > 0)[0]
-            x0, x1 = (int(xs.min()), int(xs.max())) if len(xs) else (0, bw - 1)
-        vlines = [round(x0 + j * (x1 - x0) / 9) for j in range(10)]
-
-    cells: list[Cell] = []
-    rows = ((top, middle, "B"), (middle, bottom, "W"))
-    for ry0, ry1, owner in rows:
-        my = round((ry1 - ry0) * PIT_MARGIN_Y)
-        for j in range(9):
-            cx0, cx1 = vlines[j], vlines[j + 1]
-            mx = round((cx1 - cx0) * PIT_MARGIN_X)
-            gx0 = max(0, x + cx0 - mx)
-            gx1 = min(w, x + cx1 + mx)
-            gy0 = max(0, y + ry0 - my)
-            gy1 = min(h, y + ry1 + my)
-            if gx1 - gx0 < 4 or gy1 - gy0 < 4:
-                continue
-            pit_index = 9 - j if owner == "B" else j + 1
-            cells.append(Cell(
-                checkpoint, owner, (gx0, gy0, gx1 - gx0, gy1 - gy0),
-                Image.fromarray(gray[gy0:gy1, gx0:gx1]),
-                kind="pit", pit_index=pit_index,
-            ))
-    return cells
-
-
 def extract_diagram_cells(sheet: Image.Image) -> list[Cell]:
-    """All board-diagram cells from the 8 summary strips between table bands.
-
-    After every 10 moves the scorer fills a small board diagram: the box
-    protruding ABOVE the strip is the Kost. (Black) kazan, the box BELOW is
-    the Bast. (White) kazan, and the 2x9 grid between them holds the pit
-    counts ('x' = tuzdyk, '-' = 0, or a 1-2 digit number). Returned as Cell
-    objects with move_no = the checkpoint move (10, 20, ... 80), kind
-    "kazan"/"pit", side "B"/"W" (row owner for pits) and pit_index 1-9.
-    """
     gray = np.asarray(sheet)
-    h, w = gray.shape
-    mask = _grid_mask(gray)
-    quads = _find_table_quads(gray)
-    table_area = float(np.median([cv2.contourArea(q) for q in quads]))
-
-    # Diagram strips are located by table position, not by enumeration order:
-    # the strip for checkpoint 10*(4*band + col + 1) sits below table `col` of
-    # band `band`, in the gap under that band. Handwriting sometimes bridges
-    # neighboring strips into one connected component, so wide components are
-    # kept and carved by each table's x-range.
-    n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-    components = [
-        tuple(int(v) for v in stats[i][:4])
-        for i in range(1, n)
-        if stats[i][2] > w * 0.05
-        and h * 0.02 < stats[i][3] < h * 0.12
-        and stats[i][2] > 1.5 * stats[i][3]
-        and stats[i][2] * stats[i][3] < 2.5 * table_area
-    ]
-
-    top_quads, bottom_quads = quads[:4], quads[4:]
-    zones = (
-        (top_quads, (max(q[:, 1].max() for q in top_quads),
-                     min(q[:, 1].min() for q in bottom_quads))),
-        (bottom_quads, (max(q[:, 1].max() for q in bottom_quads), h)),
-    )
-
-    strips: list[tuple[int, tuple[int, int, int, int]]] = []
-    for band, (band_quads, (zy0, zy1)) in enumerate(zones):
-        for col, quad in enumerate(band_quads):
-            tx0, tx1 = float(quad[:, 0].min()), float(quad[:, 0].max())
-            parts = []
-            for cx, cy, cw, ch in components:
-                yc = cy + ch / 2
-                overlap = min(cx + cw, tx1) - max(cx, tx0)
-                if zy0 < yc < zy1 and overlap > 0.3 * (tx1 - tx0):
-                    parts.append((cx, cy, cw, ch))
-            if not parts:
-                continue
-            pad = int(0.02 * w)
-            sx0 = max(int(tx0) - pad, min(cx for cx, *_ in parts))
-            sx1 = min(int(tx1) + pad, max(cx + cw for cx, _, cw, _ in parts))
-            sy0 = min(cy for _, cy, *_ in parts)
-            sy1 = max(cy + ch for _, cy, _, ch in parts)
-            checkpoint = (band * 4 + col + 1) * 10
-            strips.append((checkpoint, (sx0, sy0, sx1 - sx0, sy1 - sy0)))
-
+    try:
+        geom = _get_page_geometry(gray)
+    except Exception:
+        return []  # Defensive: If page is utterly broken, just skip diagrams
+        
     cells: list[Cell] = []
-    for checkpoint, (x, y, bw, bh) in strips:
-        cells.extend(_strip_pit_grid(mask, gray, (x, y, bw, bh), checkpoint))
-        sub = mask[y : y + bh, x : x + bw]
-        long_rows = np.where((sub > 0).sum(axis=1) > bw * 0.55)[0]
-        if len(long_rows) == 0:
-            continue
-        # kazan boxes are ~1 row tall; a tight zone avoids swallowing the
-        # neighboring table's header text below the strip
-        zones = {
-            "B": (max(0, y + int(long_rows.min()) - 30), y + int(long_rows.min()) - 1, False),
-            "W": (y + int(long_rows.max()) + 3, min(h, y + int(long_rows.max()) + 31), True),
-        }
-        for side, (gy0, gy1, truncate_below) in zones.items():
-            if gy1 - gy0 < 8:
-                continue
-            zone = mask[gy0:gy1, x : x + bw]
-            # stop at any full-width line (a neighboring table's grid)
-            full = np.where((zone > 0).sum(axis=1) > bw * 0.7)[0]
-            if len(full):
-                if truncate_below:
-                    zone = zone[: full.min()]
-                else:
-                    zone = zone[full.max() + 1 :]
-                    gy0 += int(full.max()) + 1
-            ys, xs = np.where(zone > 0)
-            if len(xs) < 15:
-                continue
-            bx0, bx1 = int(xs.min()), int(xs.max())
-            by0, by1 = gy0 + int(ys.min()), gy0 + int(ys.max())
-            if bx1 - bx0 < 10 or by1 - by0 < 8:
-                continue
-            cx0, cy0 = max(0, x + bx0 - 3), max(0, by0 - 2)
-            cx1, cy1 = min(w, x + bx1 + 4), min(h, by1 + 3)
-            cells.append(Cell(
-                checkpoint, side, (cx0, cy0, cx1 - cx0, cy1 - cy0),
-                Image.fromarray(gray[cy0:cy1, cx0:cx1]),
-                kind="kazan",
+    
+    for band in range(2):
+        for col in range(4):
+            checkpoint = (band * 4 + col + 1) * 10
+            base_x = geom["col_xs"][col]
+            
+            # Find the vertical center of the diagram gap
+            if band == 0:
+                diag_center_y = (geom["top_y"] + geom["bh"] + geom["bot_y"]) / 2.0
+            else:
+                offset = (geom["top_y"] + geom["bh"] + geom["bot_y"]) / 2.0 - geom["top_y"]
+                diag_center_y = geom["bot_y"] + offset
+            
+            # 2x9 Grid Boundaries (exactly 2 cell heights total)
+            grid_y0 = diag_center_y - geom["cell_h"]
+            grid_y1 = diag_center_y
+            grid_y2 = diag_center_y + geom["cell_h"]
+            
+            # Center the 9 pits horizontally under the move block
+            total_grid_w = 9 * geom["pit_w"]
+            grid_start_x = base_x + (geom["bw"] - total_grid_w) / 2.0
+            
+            # Extract 18 Pits
+            for ry0, ry1, owner in ((grid_y0, grid_y1, "B"), (grid_y1, grid_y2, "W")):
+                my = (ry1 - ry0) * PIT_MARGIN_Y
+                for j in range(9):
+                    px0 = grid_start_x + j * geom["pit_w"]
+                    px1 = px0 + geom["pit_w"]
+                    mx = (px1 - px0) * PIT_MARGIN_X
+                    
+                    pit_index = 9 - j if owner == "B" else j + 1
+                    cells.append(_create_cell_from_warped(
+                        geom, px0 - mx, ry0 - my, px1 + mx, ry1 + my,
+                        checkpoint, owner, kind="pit", pit_index=pit_index
+                    ))
+            
+            # Extract Kazans (Exactly above/below the 5th and 6th pit cells)
+            # 5th and 6th pits = j=4 and j=5. So start offset is 4 * pit width, width is 2 * pit width.
+            kx0 = grid_start_x + 4 * geom["pit_w"]
+            kx1 = kx0 + 2 * geom["pit_w"]
+            
+            # Black Kazan (Top) - Exactly 1 height unit UP
+            cells.append(_create_cell_from_warped(
+                geom, kx0, grid_y0 - geom["cell_h"], kx1, grid_y0,
+                checkpoint, "B", kind="kazan"
             ))
+            
+            # White Kazan (Bottom) - Exactly 1 height unit DOWN
+            cells.append(_create_cell_from_warped(
+                geom, kx0, grid_y2, kx1, grid_y2 + geom["cell_h"],
+                checkpoint, "W", kind="kazan"
+            ))
+            
     return cells
-
 
 def clean_cell(image: Image.Image) -> tuple[Image.Image, float]:
     """Remove printed grid-line fragments from a cell crop.
