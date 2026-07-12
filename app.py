@@ -56,7 +56,9 @@ from togyz.pipeline import load_classifier, run_pipeline
 MAX_IMAGES = 5
 MODEL_DIR = Path(__file__).parent / "models"
 BEAM_CHOICES = [str(2**k) for k in range(10, 31)]  # 1024 ... 2^30
-DEFAULT_BEAM = "8192"
+# A full ~160-ply game costs roughly (width/1024) x 12s of beam search, so the
+# default stays modest; the board-diagram evidence prunes well at this width.
+DEFAULT_BEAM = "2048"
 
 # accepted spellings of a game result -> pipeline result code
 RESULT_MAP = {
@@ -170,10 +172,11 @@ def _pgn_tags(meta: dict, game: dict) -> str:
 
 
 def _process_one(image_path, game: dict, meta: dict, beam_width: int,
-                 base_name: str, out_dir: Path):
+                 base_name: str, out_dir: Path, progress_cb=None):
     """Run the pipeline on one image; return (row, gallery_item, files, warnings)."""
     out = run_pipeline(image_path, _MOVES, _DIAGRAM,
-                       result=game["result"], beam_width=beam_width)
+                       result=game["result"], beam_width=beam_width,
+                       progress_cb=progress_cb)
 
     stop = out["stopped"]
     stop_txt = stop.get("reason", "")
@@ -194,11 +197,32 @@ def _process_one(image_path, game: dict, meta: dict, beam_width: int,
     return row, (out["annotated_image"], caption), files, warnings
 
 
-def convert(meta_text, games_text, beam_choice, img1, img2, img3, img4, img5):
-    """One batch: up to 5 images sharing tournament metadata."""
-    images = [img for img in (img1, img2, img3, img4, img5) if img]
+def _as_paths(files) -> list[str]:
+    """Normalize the multi-file uploader value into a list of file paths."""
+    if not files:
+        return []
+    if isinstance(files, (str, os.PathLike)):
+        files = [files]
+    paths = []
+    for f in files:
+        # gr.File yields str paths (type="filepath") or objects with .name
+        paths.append(f if isinstance(f, str) else getattr(f, "name", str(f)))
+    return paths
+
+
+def convert(meta_text, games_text, beam_choice, files, progress=gr.Progress()):
+    """One batch: up to 5 images sharing tournament metadata.
+
+    A generator: it yields (table, gallery, zip, warnings) after each image so
+    results stream in one by one; the zip download is assembled only at the
+    end and contains every game's PGNs appended together.
+    """
+    images = _as_paths(files)
     if not images:
         raise gr.Error("Please upload at least one scoresheet image.")
+    if len(images) > MAX_IMAGES:
+        raise gr.Error(f"This demo handles at most {MAX_IMAGES} images per run "
+                       f"(got {len(images)}).")
 
     # parse everything up front - all input errors surface before any heavy work
     meta = _parse_meta(meta_text)
@@ -210,39 +234,54 @@ def convert(meta_text, games_text, beam_choice, img1, img2, img3, img4, img5):
 
     out_dir = Path(tempfile.mkdtemp(prefix="togyz_"))
     round_slug = _safe_slug(meta["round"])
+    n = len(images)
     rows, gallery, all_files, all_warnings = [], [], [], []
 
-    for i, (img, game) in enumerate(zip(images, games), start=1):
-        prefix = f"round{round_slug}_game{i}" if round_slug else f"game{i}"
+    def warn_md():
+        return "\n".join(f"⚠ {w}" for w in dict.fromkeys(all_warnings))
+
+    for i, (img, game) in enumerate(zip(images, games)):
+        name = Path(img).name
+        prefix = f"round{round_slug}_game{i + 1}" if round_slug else f"game{i + 1}"
+
+        def cb(frac, desc, i=i, name=name):
+            # blend per-image progress into an overall 0..1 bar
+            progress((i + frac) / n, desc=f"Image {i + 1}/{n} ({name}): {desc}")
+
+        cb(0.0, "starting")
         try:
             row, gal, files, warns = _process_one(
-                img, game, meta, beam_width, prefix, out_dir
+                img, game, meta, beam_width, prefix, out_dir, progress_cb=cb
             )
         except Exception as exc:  # one bad image must not kill the batch
-            rows.append([prefix, 0, f"error: {exc}", ""])
+            rows.append([f"{prefix} ({name})", 0, f"error: {exc}", ""])
+            yield rows[:], gallery[:], None, warn_md()
             continue
+        row[0] = f"{row[0]} ({name})"
         rows.append(row)
         gallery.append(gal)
         all_files.extend(files)
         all_warnings.extend(warns)
+        # stream this image's result immediately; zip is built only at the end
+        yield rows[:], gallery[:], None, warn_md()
 
-    warnings_md = "\n".join(f"⚠ {w}" for w in dict.fromkeys(all_warnings))
     if not all_files:
         # every image errored - still return the table so the user sees why
-        return rows, gallery, None, warnings_md
+        yield rows[:], gallery[:], None, warn_md()
+        return
 
     zip_path = out_dir / (f"round{round_slug}_pgns.zip" if round_slug else "pgns.zip")
     with zipfile.ZipFile(zip_path, "w") as zf:
         for f in all_files:
             zf.write(f, arcname=Path(f).name)
 
-    return rows, gallery, str(zip_path), warnings_md
+    yield rows[:], gallery[:], str(zip_path), warn_md()
 
 
-def _busy_wrapper(*args):
+def _busy_wrapper(meta_text, games_text, beam_choice, files, progress=gr.Progress()):
     """Turn infrastructure overload into a friendly message instead of a 500."""
     try:
-        return convert(*args)
+        yield from convert(meta_text, games_text, beam_choice, files, progress)
     except gr.Error:
         raise
     except Exception as exc:  # noqa: BLE001 - surface anything else gracefully
@@ -255,9 +294,10 @@ def _busy_wrapper(*args):
 with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
     gr.Markdown(
         "# Togyzkumalak Scoresheet Reader\n"
-        "Upload up to **5** scoresheet photos of one round as a single batch, "
+        "Upload up to **5** scoresheet photos of one round in a single batch, "
         "describe the round and the games in the two text fields, then "
-        "**Convert** to download the PGNs.\n\n"
+        "**Convert**. Results stream in image by image with a live progress "
+        "bar; the combined PGN download appears once every image is done.\n\n"
         "Outputs per game: `beam` (best legal reconstruction), `raw` (pure OCR), "
         "`legal` (strict replay). Free demo — a first run may wake the Space, and "
         "images are processed one at a time."
@@ -280,16 +320,20 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
               "thorough; very large values are trimmed to fit memory)",
     )
 
-    image_slots = [
-        gr.Image(label=f"Game {i + 1}", type="filepath", height=150)
-        for i in range(MAX_IMAGES)
-    ]
+    image_files = gr.File(
+        label=f"Scoresheet photos (up to {MAX_IMAGES}, in the same order as the "
+              "game lines above)",
+        file_count="multiple",
+        file_types=["image"],
+        type="filepath",
+    )
 
     convert_btn = gr.Button("Convert", variant="primary")
 
     results_table = gr.Dataframe(
         headers=["game", "legal plies", "stopped", "beam PGN"],
-        label="Results", wrap=True, interactive=False,
+        label="Results (stream in as each image finishes)",
+        wrap=True, interactive=False,
     )
     warnings_md = gr.Markdown()
     gallery = gr.Gallery(label="Annotated reconstruction", columns=2, height="auto")
@@ -297,7 +341,7 @@ with gr.Blocks(title="Togyzkumalak Scoresheet Reader") as demo:
 
     convert_btn.click(
         _busy_wrapper,
-        inputs=[meta_box, games_box, beam_dd, *image_slots],
+        inputs=[meta_box, games_box, beam_dd, image_files],
         outputs=[results_table, gallery, zip_out, warnings_md],
     )
 

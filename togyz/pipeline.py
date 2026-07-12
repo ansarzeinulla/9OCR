@@ -117,14 +117,12 @@ def classify_cells(images, clf: Classifier, temperature=1.0, tta=True, batch_siz
 # --------------------------------------------------------------------------- #
 # Legal-move scoring, kazan evidence, beam search  (numpy port)
 # --------------------------------------------------------------------------- #
-def _legal_scores(probs, legal_moves, classes, class_idx):
-    """Redistribute the 162-class distribution over the current legal moves.
+def _ply_marginals(probs, classes):
+    """Source/landing digit marginals and the x-mark mass for one ply.
 
-    A legal move earns credit from (a) its exact class string and (b) a
-    factorized term P(source digit) * P(landing digit), times agreement with
-    the written x-mark probability. Scores stay UNNORMALIZED for the beam so a
-    hypothesis whose legal set explains the observation poorly accumulates a
-    genuinely low joint likelihood (measured: 24/39 vs 29/39 when normalized).
+    Depends only on the ply's class distribution, so the beam computes it
+    once per ply and shares it across every hypothesis (this used to be
+    recomputed per hypothesis - the dominant cost at large beam widths).
     """
     source_marginal = [0.0] * 9
     landing_marginal = [0.0] * 9
@@ -136,7 +134,19 @@ def _legal_scores(probs, legal_moves, classes, class_idx):
         landing_marginal[int(c[1]) - 1] += p
         if c.endswith("x"):
             x_marginal += p
+    return source_marginal, landing_marginal, x_marginal
 
+
+def _legal_scores(probs, legal_moves, class_idx, marginals):
+    """Redistribute the 162-class distribution over the current legal moves.
+
+    A legal move earns credit from (a) its exact class string and (b) a
+    factorized term P(source digit) * P(landing digit), times agreement with
+    the written x-mark probability. Scores stay UNNORMALIZED for the beam so a
+    hypothesis whose legal set explains the observation poorly accumulates a
+    genuinely low joint likelihood (measured: 24/39 vs 29/39 when normalized).
+    """
+    source_marginal, landing_marginal, x_marginal = marginals
     scored = []
     for move in legal_moves:
         exact = float(probs[class_idx[move.notation]])
@@ -210,13 +220,14 @@ def safe_beam_width(beam_width: int, per_ply: int = 9) -> int:
 
 
 def beam_decode(ply_probs, classes, beam_width=1024, per_ply=9, result=None,
-                checkpoints=None):
+                checkpoints=None, progress_cb=None):
     """Longest fully-legal move sequence with the highest joint probability,
     exploring all `per_ply` legal continuations per ply; the final pool is
     re-ranked by diagram-checkpoint and known-result consistency.
 
     `beam_width` is capped by `safe_beam_width` so user-requested widths up
     to 2^30 degrade into a narrower beam instead of exhausting RAM.
+    `progress_cb(ply_index, total_plies)` is called once per ply if given.
 
     Returns (annotated_moves, log_prob, per_ply_share_list).
     """
@@ -225,11 +236,16 @@ def beam_decode(ply_probs, classes, beam_width=1024, per_ply=9, result=None,
     class_idx = {c: i for i, c in enumerate(classes)}
     active = [(Game(), [], [], 0.0)]  # (game, annotated_moves, chosen_shares, logp)
     finished = []
+    total_plies = len(ply_probs)
 
-    for probs in ply_probs:
+    for ply_index, probs in enumerate(ply_probs):
+        if progress_cb:
+            progress_cb(ply_index, total_plies)
+        # marginals are identical across all hypotheses this ply - compute once
+        marginals = _ply_marginals(probs, classes)
         expanded = []
         for game, moves, chosen, logp in active:
-            candidates = _legal_scores(probs, game.legal_moves(), classes, class_idx)
+            candidates = _legal_scores(probs, game.legal_moves(), class_idx, marginals)
             for raw, share, move in candidates[:per_ply]:
                 nxt = game.copy()
                 played = nxt.play(move.action)
@@ -263,17 +279,24 @@ def format_pgn(plies: list[str]) -> str:
 # --------------------------------------------------------------------------- #
 def run_pipeline(image, moves_clf: Classifier, diagram_clf: Classifier | None = None,
                  result=None, topk=5, beam_width=8192, per_ply=9,
-                 temperature=1.0, tta=True, save_cells_dir=None):
+                 temperature=1.0, tta=True, save_cells_dir=None, progress_cb=None):
     """Read one scoresheet image into game records.
 
     `image` is a path or a PIL.Image. Returns a dict with the reconstructed
     PGNs and diagnostics; no files are written unless `save_cells_dir` is set
     (the CLI uses it, the Gradio app does not).
 
+    `progress_cb(frac, desc)` - if given - is called with a 0..1 fraction and
+    a human-readable phase description as the read progresses.
+
     Keys: beam_pgn, raw_pgn, legal_pgn, game_json (dict), stopped,
     plies_scanned, legal_plies, beam_plies, checkpoint_report, warnings,
     annotated_image (PIL), median_cell_height, low_resolution (bool).
     """
+    def report(frac, desc):
+        if progress_cb:
+            progress_cb(frac, desc)
+
     classes = moves_clf.classes
     empty_idx = classes.index(EMPTY)
     warnings: list[str] = []
@@ -284,10 +307,12 @@ def run_pipeline(image, moves_clf: Classifier, diagram_clf: Classifier | None = 
             "inside the memory budget"
         )
 
+    report(0.0, "detecting tables and cells")
     cells, sheet, gridlines = extract_cells(image, with_gridlines=True)
     cells.sort(key=lambda c: (c.move_no, c.side != "W"))  # game order: 1W 1B 2W ...
     median_h = sorted(c.bbox[3] for c in cells)[len(cells) // 2]
 
+    report(0.05, f"classifying {len(cells)} move cells")
     cleaned = [clean_cell(c.image) for c in cells]  # (image, ink_ratio) pairs
     all_probs = classify_cells(
         [img for img, _ in cleaned], moves_clf, temperature=temperature, tta=tta
@@ -355,6 +380,7 @@ def run_pipeline(image, moves_clf: Classifier, diagram_clf: Classifier | None = 
     checkpoints, checkpoint_report = {}, []
     diagram_cells, diagram_labels = [], {}
     if diagram_clf is not None:
+        report(0.30, "reading board diagrams")
         dg_classes = diagram_clf.classes
         value_names = [str(v) for v in range(82)]
         kazan_allowed = set(str(v) for v in range(10, 82))
@@ -404,10 +430,15 @@ def run_pipeline(image, moves_clf: Classifier, diagram_clf: Classifier | None = 
                     img.save(cells_dir /
                              f"{cell.kind}_{cell.move_no:02d}_{cell.side}{suffix}.png")
 
+    def beam_progress(ply_index, total):
+        report(0.45 + 0.53 * (ply_index / max(total, 1)),
+               f"reconstructing game (ply {ply_index + 1}/{total})")
+
     beam_moves, beam_logp, beam_shares = beam_decode(
         ply_prob_arrays, classes, effective_width, per_ply,
-        result=result, checkpoints=checkpoints,
+        result=result, checkpoints=checkpoints, progress_cb=beam_progress,
     )
+    report(1.0, "done")
     beam_detail = [
         {"move": p["move"], "side": p["side"], "chosen": m,
          "prob": round(q, 4), "agrees_with_raw": m.rstrip("+") == p["raw"]}
